@@ -435,7 +435,7 @@ def handle_message(event):
             # 提示正確的換班請求格式
             line_bot_api.reply_message(
                 event.reply_token,
-                TextSendMessage(text="請使用正確的換班請求格式：\n我希望在YYYYMMDD HH:MM (24小時制)跟你換班 @用戶名\n\n例如：\n我希望在20250530 08:00跟你換班 @張書豪-Ragic Customize!")
+                TextSendMessage(text="請使用正確的換班請求格式：\n我希望在YYYYMMDD HH:MM (24小時制)跟你換班 @用戶名\n\n例如：\n我希望在20071231 08:00跟你換班 @劉德華")
             )
     except Exception as e:
         print(f"處理訊息時發生錯誤: {str(e)}")
