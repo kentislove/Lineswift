@@ -21,7 +21,7 @@ from googleapiclient.errors import HttpError
 # ====== 環境變數設定 ======
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
-GOOGLE_CALENDAR_ID = "e82507ec740159b78265d033f0f38f13df4fa8514f8995f22a605891ae54e46f@group.calendar.google.com"
+GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "")
 
 # 確認環境變數已設置
 if not LINE_CHANNEL_SECRET or not LINE_CHANNEL_ACCESS_TOKEN:
@@ -39,8 +39,18 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 SHIFT_REQUEST_PATTERN = r"我希望在(\d{8})\s+(\d{2}):(\d{2})跟你換班\s*@(.+)"
 
 # ====== 用戶管理 ======
+# 初始化用戶映射表 - 預設已知用戶的名稱與 LINE ID 對應關係
+# 格式: {"用戶名稱": "LINE_USER_ID"}
+# 注意: 請將以下示例替換為您實際的用戶名稱和 LINE ID
+INITIAL_USER_MAPPING = {
+    "張書豪-Ragic Customize!": "U1234567890abcdef1234567890abcdef",  # 請替換為實際 LINE ID
+    "KentChang-廠內維修中": "U0987654321fedcba0987654321fedcba",  # 請替換為實際 LINE ID
+    # 可以添加更多用戶
+}
+
 # 用於存儲用戶名稱與 LINE ID 的對應關係
-user_mapping = {}
+user_mapping = INITIAL_USER_MAPPING.copy()
+
 # 用於存儲換班請求
 shift_requests = {}
 
@@ -261,6 +271,7 @@ def handle_message(event):
             user_name = user_profile.display_name
             # 更新用戶映射
             user_mapping[user_name] = user_id
+            print(f"用戶映射更新: {user_name} -> {user_id}")
         except LineBotApiError:
             user_name = "未知用戶"
         
@@ -297,9 +308,13 @@ def handle_message(event):
             # 檢查目標用戶是否存在
             target_user_id = user_mapping.get(target_user)
             if not target_user_id:
+                # 列出所有已知用戶，幫助用戶選擇正確的用戶名稱
+                known_users = list(user_mapping.keys())
+                user_list = "\n".join([f"- {name}" for name in known_users])
+                
                 line_bot_api.reply_message(
                     event.reply_token,
-                    TextSendMessage(text=f"找不到用戶 '{target_user}'，請確認用戶名稱正確且該用戶已使用過本系統")
+                    TextSendMessage(text=f"找不到用戶 '{target_user}'，請確認用戶名稱正確。\n\n已知用戶列表:\n{user_list}")
                 )
                 return
             
@@ -409,11 +424,18 @@ def handle_message(event):
                     request["requester_id"],
                     TextSendMessage(text=f"{request['target_name']} 已拒絕您在 {request['date']} {request['time']} 的換班請求")
                 )
+        elif text == "查看用戶映射":
+            # 管理員功能：查看當前用戶映射
+            mapping_text = "\n".join([f"{name}: {id}" for name, id in user_mapping.items()])
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=f"當前用戶映射:\n{mapping_text}")
+            )
         else:
             # 提示正確的換班請求格式
             line_bot_api.reply_message(
                 event.reply_token,
-                TextSendMessage(text="請使用正確的換班請求格式：\n我希望在YYYYMMDD HH:MM (24小時制)跟你換班 @用戶名\n\n例如：\n我希望在20250530 08:00跟你換班 @小明")
+                TextSendMessage(text="請使用正確的換班請求格式：\n我希望在YYYYMMDD HH:MM (24小時制)跟你換班 @用戶名\n\n例如：\n我希望在20250530 08:00跟你換班 @張書豪-Ragic Customize!")
             )
     except Exception as e:
         print(f"處理訊息時發生錯誤: {str(e)}")
