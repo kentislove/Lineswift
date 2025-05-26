@@ -1,95 +1,33 @@
 import os
-from fastapi import FastAPI, Request
+import re
+from datetime import datetime
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import gradio as gr
-from typing import List, Tuple
-from langchain.embeddings.openai import OpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain.llms import OpenAI
-from langchain.text_splitter import CharacterTextSplitter
-from utils import load_documents_from_folder
-
-# ====== 設定區 ======
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-# 相似度門檻，可透過環境變數調整，預設 0.9
-SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.9"))
-
-# Local paths
-VECTOR_STORE_PATH = "./faiss_index"
-DOCUMENTS_PATH = "./docs"
-
-# 確保資料夾存在
-os.makedirs(VECTOR_STORE_PATH, exist_ok=True)
-os.makedirs(DOCUMENTS_PATH, exist_ok=True)
-
-# ====== 嵌入模型與 LLM ======
-# 使用 OpenAI 文字嵌入模型（最便宜的 text-embedding-ada-002）
-embedding_model = OpenAIEmbeddings(
-    openai_api_key=OPENAI_API_KEY,
-    model="text-embedding-ada-002"
-)
-# 使用最便宜的 chat 模型（gpt-3.5-turbo）作為 fallback
-openai_llm = OpenAI(
-    openai_api_key=OPENAI_API_KEY,
-    model_name="gpt-3.5-turbo",
-    temperature=0.3
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError
+from linebot.models import (
+    MessageEvent, TextMessage, TextSendMessage,
+    TemplateSendMessage, ConfirmTemplate, MessageAction
 )
 
-vectorstore: FAISS = None
+# ====== 環境變數設定 ======
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 
-# ====== Vector Store 構建 ======
-def build_vector_store() -> FAISS:
-    documents = load_documents_from_folder(DOCUMENTS_PATH)
-    if not documents:
-        raise RuntimeError(
-            "docs 資料夾內沒有可用文件，請至少放入一份 txt/pdf/doc/docx/xls/xlsx/csv 檔案！"
-        )
-    splitter = CharacterTextSplitter(chunk_size=500, chunk_overlap=100)
-    texts = splitter.split_documents(documents)
-    faiss_db = FAISS.from_documents(texts, embedding_model)
-    faiss_db.save_local(VECTOR_STORE_PATH)
-    return faiss_db
+# 確認環境變數已設置
+if not LINE_CHANNEL_SECRET or not LINE_CHANNEL_ACCESS_TOKEN:
+    raise ValueError("請設置 LINE_CHANNEL_SECRET 和 LINE_CHANNEL_ACCESS_TOKEN 環境變數")
 
-# 確保 vectorstore 已載入或已建構
-def ensure_vectorstore():
-    global vectorstore
-    if vectorstore is None:
-        if os.path.exists(VECTOR_STORE_PATH):
-            vectorstore = FAISS.load_local(
-                VECTOR_STORE_PATH,
-                embedding_model,
-                allow_dangerous_deserialization=True
-            )
-        else:
-            vectorstore = build_vector_store()
+# ====== LINE Bot 設定 ======
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# ====== 問答主邏輯 ======
-def rag_answer(question: str) -> str:
-    # 向量相似度檢索
-    ensure_vectorstore()
-    try:
-        docs_and_scores: List[Tuple] = vectorstore.similarity_search_with_score(
-            question, k=1
-        )
-    except Exception:
-        # 索引不存在或異常，重建後再試一次
-        vectorstore = build_vector_store()
-        docs_and_scores = vectorstore.similarity_search_with_score(
-            question, k=1
-        )
+# ====== 換班請求正則表達式 ======
+# 匹配格式: "我希望在YYYYMMDD[早/下/晚]午HH:MM跟你換班 @用戶名"
+SHIFT_REQUEST_PATTERN = r"我希望在(\d{8})([早下晚])上?(\d{2}):(\d{2})跟你換班\s*@(.+)"
 
-    if docs_and_scores:
-        doc, score = docs_and_scores[0]
-        # FAISS L2 distance 轉成相似度分數 (越接近 1 越相似)
-        similarity = 1 / (1 + score)
-        if similarity >= SIMILARITY_THRESHOLD:
-            return doc.page_content
-
-    # 若相似度未達門檻，使用 LLM 回答
-    return openai_llm(question)
-
-# ====== FastAPI 與 Gradio 啟動區 ======
+# ====== FastAPI 設定 ======
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -101,28 +39,91 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    return {"status": "running"}
+    return {"status": "running", "message": "LINE Bot 換班系統已啟動"}
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    body = await request.json()
-    user_message = body.get("message", "")
-    reply = rag_answer(user_message)
-    return JSONResponse({"reply": reply})
+    # 獲取 X-Line-Signature 標頭值
+    signature = request.headers.get("X-Line-Signature", "")
+    
+    # 獲取請求體作為文本
+    body = await request.body()
+    body_text = body.decode("utf-8")
+    
+    try:
+        # 驗證簽名
+        handler.handle(body_text, signature)
+    except InvalidSignatureError:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+    
+    # 即使處理過程中出錯，也返回 200 OK 給 LINE 平台
+    return JSONResponse(content={"status": "ok"})
 
-# Gradio UI
-with gr.Blocks() as demo:
-    gr.Markdown("# 智能問答機器人")
-    with gr.Row():
-        with gr.Column():
-            qbox = gr.Textbox(label="請輸入問題")
-            abox = gr.Textbox(label="回答")
-            btn = gr.Button("送出")
-            btn.click(fn=rag_answer, inputs=qbox, outputs=abox)
-
-# 將 Gradio 掛載到 FastAPI
-from gradio.routes import mount_gradio_app
-app = mount_gradio_app(app, demo, path="/gradio")
+# ====== LINE 訊息處理 ======
+@handler.add(MessageEvent, message=TextMessage)
+def handle_message(event):
+    try:
+        user_id = event.source.user_id
+        text = event.message.text
+        
+        # 檢查是否為換班請求
+        match = re.match(SHIFT_REQUEST_PATTERN, text)
+        if match:
+            date_str, time_period, hour, minute, target_user = match.groups()
+            
+            # 解析日期
+            try:
+                date = datetime.strptime(date_str, "%Y%m%d").strftime("%Y/%m/%d")
+            except ValueError:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text="日期格式錯誤，請使用YYYYMMDD格式，例如：20250530")
+                )
+                return
+            
+            # 時間段轉換
+            time_period_full = {"早": "早上", "下": "下午", "晚": "晚上"}.get(time_period, time_period)
+            
+            # 構建確認訊息
+            confirm_message = f"換班請求\n請求在{date} {time_period_full}{hour}:{minute}進行換班"
+            
+            # 發送確認模板
+            line_bot_api.reply_message(
+                event.reply_token,
+                TemplateSendMessage(
+                    alt_text="換班請求確認",
+                    template=ConfirmTemplate(
+                        text=confirm_message,
+                        actions=[
+                            MessageAction(label="批准", text="批准換班"),
+                            MessageAction(label="拒絕", text="拒絕換班")
+                        ]
+                    )
+                )
+            )
+        elif text in ["批准換班", "拒絕換班"]:
+            # 處理換班回應
+            response = "您已批准換班請求，系統將更新日曆。" if text == "批准換班" else "您已拒絕換班請求。"
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=response)
+            )
+        else:
+            # 提示正確的換班請求格式
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="請使用正確的換班請求格式：\n我希望在YYYYMMDD[早/下/晚]上HH:MM跟你換班 @用戶名\n\n例如：\n我希望在20250530早上08:00跟你換班 @小明")
+            )
+    except Exception as e:
+        print(f"處理訊息時發生錯誤: {str(e)}")
+        # 發送錯誤訊息給用戶
+        try:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=f"處理您的請求時發生錯誤，請稍後再試。")
+            )
+        except Exception:
+            pass  # 忽略回覆錯誤
 
 if __name__ == "__main__":
     import uvicorn
