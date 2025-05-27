@@ -43,10 +43,9 @@ SHIFT_REQUEST_PATTERN = r"我希望在(\d{8})\s+(\d{2}):(\d{2})跟你換班\s*@(
 # 格式: {"用戶名稱": "LINE_USER_ID"}
 # 注意: 請將以下示例替換為您實際的用戶名稱和 LINE ID
 INITIAL_USER_MAPPING = {
-    "張書豪-Ragic Customize!": "kent1027",  # 請替換為實際 LINE ID
-    "KentChang-廠內維修中": "newkent27",  # 請替換為實際 LINE ID
-    "Eva-家萍": "newkent27",
-# 可以添加更多用戶
+    "張書豪-Ragic Customize!": "Uf15abf85bca4ee133d1027593de4d1ad",
+    "KentChang-廠內維修中": "Ub2eb02fea865d917854d6ecaace84c70",
+    # 可以添加更多用戶
 }
 
 # 用於存儲用戶名稱與 LINE ID 的對應關係
@@ -59,18 +58,44 @@ shift_requests = {}
 def get_calendar_service():
     """獲取 Google Calendar 服務"""
     try:
-        # 從環境變數中獲取服務帳號憑證
-        service_account_info = json.loads(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "{}"))
+        # 嘗試從環境變數中獲取服務帳號憑證
+        service_account_info = None
+        
+        # 首先嘗試從 GOOGLE_SERVICE_ACCOUNT_FILE 讀取檔案
+        service_account_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
+        if service_account_file and os.path.exists(service_account_file):
+            try:
+                print(f"嘗試從檔案讀取服務帳號憑證: {service_account_file}")
+                with open(service_account_file, 'r') as f:
+                    service_account_info = json.load(f)
+                print("成功從檔案讀取服務帳號憑證")
+            except Exception as e:
+                print(f"從檔案讀取服務帳號憑證時發生錯誤: {str(e)}")
+        
+        # 如果檔案讀取失敗，嘗試從 GOOGLE_SERVICE_ACCOUNT_JSON 讀取 JSON 字串
         if not service_account_info:
-            print("警告: 未設置 GOOGLE_SERVICE_ACCOUNT_JSON 環境變數")
+            service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "{}")
+            try:
+                print("嘗試從環境變數 GOOGLE_SERVICE_ACCOUNT_JSON 讀取服務帳號憑證")
+                service_account_info = json.loads(service_account_json)
+                if not service_account_info:
+                    print("警告: GOOGLE_SERVICE_ACCOUNT_JSON 環境變數為空或格式不正確")
+            except Exception as e:
+                print(f"解析 GOOGLE_SERVICE_ACCOUNT_JSON 時發生錯誤: {str(e)}")
+        
+        if not service_account_info:
+            print("錯誤: 無法獲取服務帳號憑證，請檢查 GOOGLE_SERVICE_ACCOUNT_FILE 或 GOOGLE_SERVICE_ACCOUNT_JSON 環境變數")
             return None
             
+        # 使用服務帳號憑證創建 credentials
         credentials = google.oauth2.service_account.Credentials.from_service_account_info(
             service_account_info,
             scopes=['https://www.googleapis.com/auth/calendar']
         )
         
+        # 創建 Google Calendar 服務
         service = build('calendar', 'v3', credentials=credentials)
+        print(f"成功創建 Google Calendar 服務，使用日曆 ID: {GOOGLE_CALENDAR_ID}")
         return service
     except Exception as e:
         print(f"獲取 Google Calendar 服務時發生錯誤: {str(e)}")
@@ -90,6 +115,8 @@ def get_calendar_events(date_str):
         time_min = date.replace(hour=0, minute=0, second=0).isoformat() + 'Z'
         time_max = date.replace(hour=23, minute=59, second=59).isoformat() + 'Z'
         
+        print(f"查詢日曆事件: 日期={date_str}, 日曆ID={GOOGLE_CALENDAR_ID}")
+        
         # 獲取事件
         events_result = service.events().list(
             calendarId=GOOGLE_CALENDAR_ID,
@@ -99,7 +126,9 @@ def get_calendar_events(date_str):
             orderBy='startTime'
         ).execute()
         
-        return events_result.get('items', [])
+        events = events_result.get('items', [])
+        print(f"找到 {len(events)} 個事件")
+        return events
     except Exception as e:
         print(f"獲取日曆事件時發生錯誤: {str(e)}")
         return None
@@ -137,6 +166,8 @@ def create_or_update_event(date_str, time_str, user_name, description=None):
             },
         }
         
+        print(f"準備創建或更新事件: 日期={date_str}, 時間={time_str}, 用戶={user_name}")
+        
         # 檢查是否已有相同時間的事件
         events = get_calendar_events(date_str)
         existing_event = None
@@ -150,6 +181,7 @@ def create_or_update_event(date_str, time_str, user_name, description=None):
         
         # 更新或創建事件
         if existing_event:
+            print(f"找到現有事件，ID: {existing_event['id']}")
             # 更新現有事件的描述，添加換班歷史
             old_description = existing_event.get('description', '')
             new_description = f"{old_description}\n換班歷史: {datetime.now().strftime('%Y-%m-%d %H:%M')} - 更新為 {user_name}"
@@ -160,11 +192,14 @@ def create_or_update_event(date_str, time_str, user_name, description=None):
                 eventId=existing_event['id'],
                 body=event
             ).execute()
+            print("事件更新成功")
         else:
+            print("未找到現有事件，創建新事件")
             service.events().insert(
                 calendarId=GOOGLE_CALENDAR_ID,
                 body=event
             ).execute()
+            print("新事件創建成功")
         
         return True
     except Exception as e:
@@ -178,9 +213,12 @@ def swap_shifts(date_str, time_str, user_a, user_b):
         return False
         
     try:
+        print(f"準備交換班次: 日期={date_str}, 時間={time_str}, 從用戶={user_a} 到用戶={user_b}")
+        
         # 獲取指定日期的所有事件
         events = get_calendar_events(date_str)
         if not events:
+            print("未找到事件，創建新事件")
             # 如果沒有事件，則為兩個用戶創建新事件
             create_or_update_event(date_str, time_str, user_b, 
                                   f"排班人員: {user_b}\n換班歷史: {datetime.now().strftime('%Y-%m-%d %H:%M')} - 從 {user_a} 換班")
@@ -201,6 +239,7 @@ def swap_shifts(date_str, time_str, user_a, user_b):
         
         # 更新事件
         if target_event:
+            print(f"找到目標事件，ID: {target_event['id']}")
             # 獲取原始排班人員
             original_user = target_event.get('summary', '').replace('班表: ', '')
             
@@ -217,7 +256,9 @@ def swap_shifts(date_str, time_str, user_a, user_b):
                 eventId=target_event['id'],
                 body=target_event
             ).execute()
+            print("班次交換成功")
         else:
+            print("未找到目標事件，創建新事件")
             # 如果沒有找到事件，則創建新事件
             create_or_update_event(date_str, time_str, user_b, 
                                   f"排班人員: {user_b}\n換班歷史: {datetime.now().strftime('%Y-%m-%d %H:%M')} - 從 {user_a} 換班")
@@ -432,11 +473,51 @@ def handle_message(event):
                 event.reply_token,
                 TextSendMessage(text=f"當前用戶映射:\n{mapping_text}")
             )
+        elif text == "測試日曆":
+            # 測試 Google Calendar 連接
+            service = get_calendar_service()
+            if service:
+                try:
+                    # 嘗試列出未來 10 個事件
+                    now = datetime.utcnow().isoformat() + 'Z'
+                    events_result = service.events().list(
+                        calendarId=GOOGLE_CALENDAR_ID,
+                        timeMin=now,
+                        maxResults=10,
+                        singleEvents=True,
+                        orderBy='startTime'
+                    ).execute()
+                    events = events_result.get('items', [])
+                    
+                    if not events:
+                        line_bot_api.reply_message(
+                            event.reply_token,
+                            TextSendMessage(text="Google Calendar 連接成功，但未找到未來事件")
+                        )
+                    else:
+                        events_text = "\n".join([
+                            f"{event['summary']} ({event['start'].get('dateTime', event['start'].get('date'))})"
+                            for event in events
+                        ])
+                        line_bot_api.reply_message(
+                            event.reply_token,
+                            TextSendMessage(text=f"Google Calendar 連接成功，找到以下事件:\n{events_text}")
+                        )
+                except Exception as e:
+                    line_bot_api.reply_message(
+                        event.reply_token,
+                        TextSendMessage(text=f"Google Calendar 連接成功，但查詢事件時發生錯誤: {str(e)}")
+                    )
+            else:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text="Google Calendar 連接失敗，請檢查服務帳號憑證和日曆 ID 設定")
+                )
         else:
             # 提示正確的換班請求格式
             line_bot_api.reply_message(
                 event.reply_token,
-                TextSendMessage(text="請使用正確的換班請求格式：\n我希望在YYYYMMDD HH:MM (24小時制)跟你換班 @用戶名\n\n例如：\n我希望在20071231 08:00跟你換班 @劉德華")
+                TextSendMessage(text="請使用正確的換班請求格式：\n我希望在YYYYMMDD HH:MM (24小時制)跟你換班 @用戶名\n\n例如：\n我希望在20250530 08:00跟你換班 @張書豪-Ragic Customize!\n\n或者輸入「查看用戶映射」查看已知用戶\n輸入「測試日曆」測試 Google Calendar 連接")
             )
     except Exception as e:
         print(f"處理訊息時發生錯誤: {str(e)}")
