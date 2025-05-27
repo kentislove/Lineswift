@@ -46,6 +46,8 @@ INITIAL_USER_MAPPING = {
     "張書豪-Ragic SA Promote": "Uf15abf85bca4ee133d1027593de4d1ad",
     "KentChang-廠內維修中": "Ub2eb02fea865d917854d6ecaace84c70",
     "Eva-家萍": "eva700802",
+    "張書豪-Ragic Customize!": "kent1027",
+    "鄭銘貴": "U0c63e33715aebc37754bc2cf522ab6fa",
     # 可以添加更多用戶
 }
 
