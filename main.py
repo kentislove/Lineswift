@@ -45,7 +45,8 @@ SHIFT_REQUEST_PATTERN = r"我希望在(\d{8})\s+(\d{2}):(\d{2})跟你換班\s*@(
 INITIAL_USER_MAPPING = {
     "張書豪-Ragic Customize!": "kent1027",  # 請替換為實際 LINE ID
     "KentChang-廠內維修中": "newkent27",  # 請替換為實際 LINE ID
-    # 可以添加更多用戶
+    "Eva-家萍": "newkent27",
+# 可以添加更多用戶
 }
 
 # 用於存儲用戶名稱與 LINE ID 的對應關係
