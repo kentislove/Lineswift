@@ -430,44 +430,42 @@ def handle_message(event):
             if action == "批准換班":
                 # 更新請求狀態
                 request["status"] = "approved"
-                cal_key = request_id   # request_id 一定唯一
+
+                cal_key = request_id   # request_id 就是唯一 key
                 if cal_key not in created_calendar_events:
-                    # 請用你現有的 Google Calendar 新增事件函式
-                    success = add_event_to_google_calendar(
-                        request["date"],
-                        request["time"],
-                        request["requester_name"],
+                    # 執行 Google Calendar 換班寫入
+                    success = swap_shifts(
+                        request["date"], 
+                        request["time"], 
+                        request["requester_name"], 
                         request["target_name"]
                     )
                     if success:
                         created_calendar_events.add(cal_key)
+                        # 回覆目標用戶
+                        line_bot_api.reply_message(
+                            event.reply_token,
+                            TextSendMessage(text="您已批准換班請求，Google Calendar 已更新")
+                        )
+                    else:
+                        line_bot_api.reply_message(
+                            event.reply_token,
+                            TextSendMessage(text="您已批准換班請求，但 Google Calendar 更新失敗，請聯繫管理員")
+                        )
                 else:
+                    # 已同步過，不再重複建立
                     print("該換班事件已同步過 Google Calendar，不再重複建立")
-                # 更新 Google Calendar
-                success = swap_shifts(
-                    request["date"], 
-                    request["time"], 
-                    request["requester_name"], 
-                    request["target_name"]
-                )
-                
-                # 回覆目標用戶
-                if success:
                     line_bot_api.reply_message(
                         event.reply_token,
-                        TextSendMessage(text="您已批准換班請求，Google Calendar 已更新")
+                        TextSendMessage(text="此換班事件已經處理過，不會重複寫入 Google Calendar")
                     )
-                else:
-                    line_bot_api.reply_message(
-                        event.reply_token,
-                        TextSendMessage(text="您已批准換班請求，但 Google Calendar 更新失敗，請聯繫管理員")
-                    )
-                
-                # 通知請求者
+
+                # 通知請求者（這一段放外層即可，不影響行為）
                 line_bot_api.push_message(
                     request["requester_id"],
                     TextSendMessage(text=f"{request['target_name']} 已批准您在 {request['date']} {request['time']} 的換班請求")
                 )
+
             else:  # 拒絕換班
                 # 更新請求狀態
                 request["status"] = "rejected"
