@@ -8,306 +8,532 @@ from fastapi.responses import JSONResponse
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError, LineBotApiError
 from linebot.models import (
-    MessageEvent,
-    TextMessage,
-    TextSendMessage,
-    TemplateSendMessage,
-    ConfirmTemplate,
-    MessageAction
+    MessageEvent, TextMessage, TextSendMessage,
+    TemplateSendMessage, ConfirmTemplate, MessageAction,
+    FlexSendMessage, BubbleContainer, BoxComponent,
+    TextComponent, ButtonComponent, SeparatorComponent,
+    URIAction
 )
 import google.oauth2.service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 # ====== 環境變數設定 ======
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "")
 
+# 確認環境變數已設置
 if not LINE_CHANNEL_SECRET or not LINE_CHANNEL_ACCESS_TOKEN:
     raise ValueError("請設置 LINE_CHANNEL_SECRET 和 LINE_CHANNEL_ACCESS_TOKEN 環境變數")
+
 if not GOOGLE_CALENDAR_ID:
     print("警告: 未設置 GOOGLE_CALENDAR_ID 環境變數，Google Calendar 功能將無法正常運作")
 
-# ====== LINE Bot 初始 ======
+# ====== LINE Bot 設定 ======
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# 換班請求正則
+# ====== 換班請求正則表達式 ======
+# 匹配格式: "我希望在YYYYMMDD HH:MM (24小時制)跟你換班 @用戶名"
 SHIFT_REQUEST_PATTERN = r"我希望在(\d{8})\s+(\d{2}):(\d{2})跟你換班\s*@(.+)"
 
-# 用戶映射
+# ====== 用戶管理 ======
+# 初始化用戶映射表 - 預設已知用戶的名稱與 LINE ID 對應關係
+# 格式: {"用戶名稱": "LINE_USER_ID"}
+# 注意: 請將以下示例替換為您實際的用戶名稱和 LINE ID
 INITIAL_USER_MAPPING = {
     "張書豪-Ragic SA Promote": "Uf15abf85bca4ee133d1027593de4d1ad",
     "KentChang-廠內維修中": "Ub2eb02fea865d917854d6ecaace84c70",
     "Eva-家萍": "eva700802",
     "張書豪-Ragic Customize!": "kent1027",
     "鄭銘貴": "U0c63e33715aebc37754bc2cf522ab6fa",
+    # 可以添加更多用戶
 }
+
+# 用於存儲用戶名稱與 LINE ID 的對應關係
 user_mapping = INITIAL_USER_MAPPING.copy()
+
+# 用於存儲換班請求
 shift_requests = {}
 
-# ====== Google Calendar API ======
+# ====== Google Calendar API 設定 ======
 def get_calendar_service():
-    info = None
-    sa_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
-    if sa_file and os.path.exists(sa_file):
-        with open(sa_file, 'r', encoding='utf-8') as f:
-            info = json.load(f)
-    if not info:
-        info = json.loads(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "{}"))
-    if not info:
-        print("錯誤: 無法獲取服務帳號憑證")
+    """獲取 Google Calendar 服務"""
+    try:
+        # 嘗試從環境變數中獲取服務帳號憑證
+        service_account_info = None
+        
+        # 首先嘗試從 GOOGLE_SERVICE_ACCOUNT_FILE 讀取檔案
+        service_account_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
+        if service_account_file and os.path.exists(service_account_file):
+            try:
+                print(f"嘗試從檔案讀取服務帳號憑證: {service_account_file}")
+                with open(service_account_file, 'r') as f:
+                    service_account_info = json.load(f)
+                print("成功從檔案讀取服務帳號憑證")
+            except Exception as e:
+                print(f"從檔案讀取服務帳號憑證時發生錯誤: {str(e)}")
+        
+        # 如果檔案讀取失敗，嘗試從 GOOGLE_SERVICE_ACCOUNT_JSON 讀取 JSON 字串
+        if not service_account_info:
+            service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "{}")
+            try:
+                print("嘗試從環境變數 GOOGLE_SERVICE_ACCOUNT_JSON 讀取服務帳號憑證")
+                service_account_info = json.loads(service_account_json)
+                if not service_account_info:
+                    print("警告: GOOGLE_SERVICE_ACCOUNT_JSON 環境變數為空或格式不正確")
+            except Exception as e:
+                print(f"解析 GOOGLE_SERVICE_ACCOUNT_JSON 時發生錯誤: {str(e)}")
+        
+        if not service_account_info:
+            print("錯誤: 無法獲取服務帳號憑證，請檢查 GOOGLE_SERVICE_ACCOUNT_FILE 或 GOOGLE_SERVICE_ACCOUNT_JSON 環境變數")
+            return None
+            
+        # 使用服務帳號憑證創建 credentials
+        credentials = google.oauth2.service_account.Credentials.from_service_account_info(
+            service_account_info,
+            scopes=['https://www.googleapis.com/auth/calendar']
+        )
+        
+        # 創建 Google Calendar 服務
+        service = build('calendar', 'v3', credentials=credentials)
+        print(f"成功創建 Google Calendar 服務，使用日曆 ID: {GOOGLE_CALENDAR_ID}")
+        return service
+    except Exception as e:
+        print(f"獲取 Google Calendar 服務時發生錯誤: {str(e)}")
         return None
 
-    creds = google.oauth2.service_account.Credentials.from_service_account_info(
-        info,
-        scopes=["https://www.googleapis.com/auth/calendar"]
-    )
-    return build("calendar", "v3", credentials=creds)
-
-def get_calendar_events(date_str: str):
+def get_calendar_events(date_str):
+    """獲取指定日期的日曆事件"""
     service = get_calendar_service()
     if not service:
         return None
-    dt = datetime.strptime(date_str, "%Y%m%d")
-    tmin = dt.replace(hour=0, minute=0, second=0).isoformat() + "Z"
-    tmax = dt.replace(hour=23, minute=59, second=59).isoformat() + "Z"
-    return service.events().list(
-        calendarId=GOOGLE_CALENDAR_ID,
-        timeMin=tmin,
-        timeMax=tmax,
-        singleEvents=True,
-        orderBy="startTime"
-    ).execute().get("items", [])
+        
+    try:
+        # 將日期字符串轉換為 datetime 對象
+        date = datetime.strptime(date_str, "%Y%m%d")
+        
+        # 設置時間範圍為整天
+        time_min = date.replace(hour=0, minute=0, second=0).isoformat() + 'Z'
+        time_max = date.replace(hour=23, minute=59, second=59).isoformat() + 'Z'
+        
+        print(f"查詢日曆事件: 日期={date_str}, 日曆ID={GOOGLE_CALENDAR_ID}")
+        
+        # 獲取事件
+        events_result = service.events().list(
+            calendarId=GOOGLE_CALENDAR_ID,
+            timeMin=time_min,
+            timeMax=time_max,
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+        
+        events = events_result.get('items', [])
+        print(f"找到 {len(events)} 個事件")
+        return events
+    except Exception as e:
+        print(f"獲取日曆事件時發生錯誤: {str(e)}")
+        return None
 
 def create_or_update_event(date_str, time_str, user_name, description=None):
+    """創建或更新日曆事件"""
     service = get_calendar_service()
     if not service:
         return False
-    dt = datetime.strptime(f"{date_str} {time_str}", "%Y%m%d %H:%M")
-    start = dt.isoformat()
-    end = dt.replace(hour=dt.hour+1).isoformat()
-    body = {
-        "summary": f"班表: {user_name}",
-        "description": description or f"排班人員: {user_name}",
-        "start": {"dateTime": start, "timeZone": "Asia/Taipei"},
-        "end":   {"dateTime": end,   "timeZone": "Asia/Taipei"},
-    }
-
-    # 檢查既有事件
-    for e in get_calendar_events(date_str) or []:
-        s = e.get("start", {}).get("dateTime")
-        if s and datetime.fromisoformat(s.replace("Z","+00:00")) == dt:
-            old = e.get("description", "")
-            body["description"] = f"{old}\n換班歷史: {datetime.now().strftime('%Y-%m-%d %H:%M')} - 更新為 {user_name}"
+        
+    try:
+        # 將日期和時間字符串轉換為 datetime 對象
+        date_time = datetime.strptime(f"{date_str} {time_str}", "%Y%m%d %H:%M")
+        
+        # 設置事件開始和結束時間 (假設每個班次為 1 小時)
+        start_time = date_time.isoformat()
+        end_time = date_time.replace(hour=date_time.hour + 1).isoformat()
+        
+        # 設置事件標題和描述
+        summary = f"班表: {user_name}"
+        if not description:
+            description = f"排班人員: {user_name}"
+        
+        # 創建事件
+        event = {
+            'summary': summary,
+            'description': description,
+            'start': {
+                'dateTime': start_time,
+                'timeZone': 'Asia/Taipei',
+            },
+            'end': {
+                'dateTime': end_time,
+                'timeZone': 'Asia/Taipei',
+            },
+        }
+        
+        print(f"準備創建或更新事件: 日期={date_str}, 時間={time_str}, 用戶={user_name}")
+        
+        # 檢查是否已有相同時間的事件
+        events = get_calendar_events(date_str)
+        existing_event = None
+        
+        if events:
+            for e in events:
+                start = e.get('start', {}).get('dateTime', '')
+                if start and datetime.fromisoformat(start.replace('Z', '+00:00')) == date_time:
+                    existing_event = e
+                    break
+        
+        # 更新或創建事件
+        if existing_event:
+            print(f"找到現有事件，ID: {existing_event['id']}")
+            # 更新現有事件的描述，添加換班歷史
+            old_description = existing_event.get('description', '')
+            new_description = f"{old_description}\n換班歷史: {datetime.now().strftime('%Y-%m-%d %H:%M')} - 更新為 {user_name}"
+            event['description'] = new_description
+            
             service.events().update(
                 calendarId=GOOGLE_CALENDAR_ID,
-                eventId=e["id"],
-                body=body
+                eventId=existing_event['id'],
+                body=event
             ).execute()
-            return True
-
-    service.events().insert(
-        calendarId=GOOGLE_CALENDAR_ID,
-        body=body
-    ).execute()
-    return True
+            print("事件更新成功")
+        else:
+            print("未找到現有事件，創建新事件")
+            service.events().insert(
+                calendarId=GOOGLE_CALENDAR_ID,
+                body=event
+            ).execute()
+            print("新事件創建成功")
+        
+        return True
+    except Exception as e:
+        print(f"創建或更新日曆事件時發生錯誤: {str(e)}")
+        return False
 
 def swap_shifts(date_str, time_str, user_a, user_b):
+    """交換兩個用戶的班次"""
     service = get_calendar_service()
     if not service:
         return False
-    target = datetime.strptime(f"{date_str} {time_str}", "%Y%m%d %H:%M")
-    for e in get_calendar_events(date_str) or []:
-        s = e.get("start", {}).get("dateTime")
-        if s and datetime.fromisoformat(s.replace("Z","+00:00")) == target:
-            orig = e.get("summary","").replace("班表: ","")
-            e["summary"] = f"班表: {user_b}"
-            old_desc = e.get("description","")
-            e["description"] = (
-                f"{old_desc}\n"
-                f"換班歷史: {datetime.now().strftime('%Y-%m-%d %H:%M')} "
-                f"- 從 {orig} 換給 {user_b}"
-            )
+        
+    try:
+        print(f"準備交換班次: 日期={date_str}, 時間={time_str}, 從用戶={user_a} 到用戶={user_b}")
+        
+        # 獲取指定日期的所有事件
+        events = get_calendar_events(date_str)
+        if not events:
+            print("未找到事件，創建新事件")
+            # 如果沒有事件，則為兩個用戶創建新事件
+            create_or_update_event(date_str, time_str, user_b, 
+                                  f"排班人員: {user_b}\n換班歷史: {datetime.now().strftime('%Y-%m-%d %H:%M')} - 從 {user_a} 換班")
+            return True
+            
+        # 將日期和時間字符串轉換為 datetime 對象
+        target_time = datetime.strptime(f"{date_str} {time_str}", "%Y%m%d %H:%M")
+        
+        # 查找目標時間的事件
+        target_event = None
+        for event in events:
+            start = event.get('start', {}).get('dateTime', '')
+            if start:
+                event_time = datetime.fromisoformat(start.replace('Z', '+00:00'))
+                if event_time.hour == target_time.hour and event_time.minute == target_time.minute:
+                    target_event = event
+                    break
+        
+        # 更新事件
+        if target_event:
+            print(f"找到目標事件，ID: {target_event['id']}")
+            # 獲取原始排班人員
+            original_user = target_event.get('summary', '').replace('班表: ', '')
+            
+            # 更新事件
+            target_event['summary'] = f"班表: {user_b}"
+            
+            # 添加換班歷史
+            old_description = target_event.get('description', '')
+            new_description = f"{old_description}\n換班歷史: {datetime.now().strftime('%Y-%m-%d %H:%M')} - 從 {original_user} 換班給 {user_b}"
+            target_event['description'] = new_description
+            
             service.events().update(
                 calendarId=GOOGLE_CALENDAR_ID,
-                eventId=e["id"],
-                body=e
+                eventId=target_event['id'],
+                body=target_event
             ).execute()
-            return True
+            print("班次交換成功")
+        else:
+            print("未找到目標事件，創建新事件")
+            # 如果沒有找到事件，則創建新事件
+            create_or_update_event(date_str, time_str, user_b, 
+                                  f"排班人員: {user_b}\n換班歷史: {datetime.now().strftime('%Y-%m-%d %H:%M')} - 從 {user_a} 換班")
+        
+        return True
+    except Exception as e:
+        print(f"交換班次時發生錯誤: {str(e)}")
+        return False
 
-    # 若找不到同時段，直接新建
-    return create_or_update_event(
-        date_str, time_str, user_b,
-        f"排班人員: {user_b}\n"
-        f"換班歷史: {datetime.now().strftime('%Y-%m-%d %H:%M')} - 從 {user_a} 換班"
-    )
-
-# ====== FastAPI App ======
+# ====== FastAPI 設定 ======
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 @app.get("/")
 async def root():
-    return {"status":"running","message":"LINE Bot 換班系統已啟動"}
-
-# 查看用戶映射
-@app.get("/users")
-async def list_users():
-    return {"user_mapping": user_mapping}
-
-# 查看指定日期的 Calendar 事件
-@app.get("/calendar/events/{date_str}")
-async def view_calendar(date_str: str):
-    events = get_calendar_events(date_str)
-    if events is None:
-        raise HTTPException(status_code=500, detail="無法取得 Calendar 事件")
-    return {"date": date_str, "events": events}
-
-# 測試今天的 Calendar 事件
-@app.get("/calendar/test")
-async def test_calendar():
-    today = datetime.now().strftime("%Y%m%d")
-    events = get_calendar_events(today)
-    if events is None:
-        raise HTTPException(status_code=500, detail="無法取得今天的 Calendar 事件")
-    return {"date": today, "events": events}
+    return {"status": "running", "message": "LINE Bot 換班系統已啟動"}
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    signature = request.headers.get("X-Line-Signature","")
+    # 獲取 X-Line-Signature 標頭值
+    signature = request.headers.get("X-Line-Signature", "")
+    
+    # 獲取請求體作為文本
     body = await request.body()
+    body_text = body.decode("utf-8")
+    
     try:
-        handler.handle(body.decode(), signature)
+        # 驗證簽名
+        handler.handle(body_text, signature)
     except InvalidSignatureError:
         raise HTTPException(status_code=400, detail="Invalid signature")
-    return JSONResponse(content={"status":"ok"})
+    
+    # 即使處理過程中出錯，也返回 200 OK 給 LINE 平台
+    return JSONResponse(content={"status": "ok"})
 
+# ====== LINE 訊息處理 ======
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     try:
         user_id = event.source.user_id
         text = event.message.text
-
-        # 更新映射
+        
+        # 嘗試獲取用戶資料
         try:
-            profile = line_bot_api.get_profile(user_id)
-            user_mapping[profile.display_name] = user_id
-            user_name = profile.display_name
+            user_profile = line_bot_api.get_profile(user_id)
+            user_name = user_profile.display_name
+            # 更新用戶映射
+            user_mapping[user_name] = user_id
+            print(f"用戶映射更新: {user_name} -> {user_id}")
         except LineBotApiError:
             user_name = "未知用戶"
-
-        # 換班請求
-        m = re.match(SHIFT_REQUEST_PATTERN, text)
-        if m:
-            date_str, hh, mm, target = m.groups()
-            req_id = f"{user_id}_{date_str}_{hh}_{mm}"
-            shift_requests[req_id] = {
+        
+        # 檢查是否為換班請求
+        match = re.match(SHIFT_REQUEST_PATTERN, text)
+        if match:
+            date_str, hour, minute, target_user = match.groups()
+            
+            # 驗證日期格式
+            try:
+                date = datetime.strptime(date_str, "%Y%m%d")
+                formatted_date = date.strftime("%Y/%m/%d")
+            except ValueError:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text="日期格式錯誤，請使用YYYYMMDD格式，例如：20250530")
+                )
+                return
+            
+            # 驗證時間格式
+            try:
+                hour_int = int(hour)
+                minute_int = int(minute)
+                if hour_int < 0 or hour_int > 23 or minute_int < 0 or minute_int > 59:
+                    raise ValueError("時間格式錯誤")
+                formatted_time = f"{hour}:{minute}"
+            except ValueError:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text="時間格式錯誤，請使用24小時制，例如：08:00 或 18:30")
+                )
+                return
+            
+            # 檢查目標用戶是否存在
+            target_user_id = user_mapping.get(target_user)
+            if not target_user_id:
+                # 列出所有已知用戶，幫助用戶選擇正確的用戶名稱
+                known_users = list(user_mapping.keys())
+                user_list = "\n".join([f"- {name}" for name in known_users])
+                
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text=f"找不到用戶 '{target_user}'，請確認用戶名稱正確。\n\n已知用戶列表:\n{user_list}")
+                )
+                return
+            
+            # 儲存換班請求
+            request_id = f"{user_id}_{date_str}_{hour}_{minute}"
+            shift_requests[request_id] = {
                 "requester_id": user_id,
                 "requester_name": user_name,
-                "target_id": user_mapping.get(target),
-                "target_name": target,
+                "target_id": target_user_id,
+                "target_name": target_user,
                 "date": date_str,
-                "time": f"{hh}:{mm}",
+                "time": f"{hour}:{minute}",
                 "status": "pending"
             }
-            # 回覆申請者
+            
+            # 回覆請求者
             line_bot_api.reply_message(
                 event.reply_token,
-                TextSendMessage(text=f"已發送換班請求給 {target}，等待回應...")
+                TextSendMessage(text=f"已發送換班請求給 {target_user}，等待回應...")
             )
-            # 通知對方
+            
+            # 發送確認訊息給目標用戶
+            confirm_message = f"換班請求\n{user_name} 希望在 {formatted_date} {formatted_time} 與您換班"
+            
             line_bot_api.push_message(
-                shift_requests[req_id]["target_id"],
+                target_user_id,
                 TemplateSendMessage(
                     alt_text="換班請求確認",
                     template=ConfirmTemplate(
-                        text=(
-                            f"{user_name} 希望在 "
-                            f"{datetime.strptime(date_str,'%Y%m%d').strftime('%Y/%m/%d')} "
-                            f"{hh}:{mm} 與您換班"
-                        ),
+                        text=confirm_message,
                         actions=[
-                            MessageAction(label="批准", text=f"批准換班:{req_id}"),
-                            MessageAction(label="拒絕", text=f"拒絕換班:{req_id}")
+                            MessageAction(label="批准", text=f"批准換班:{request_id}"),
+                            MessageAction(label="拒絕", text=f"拒絕換班:{request_id}")
                         ]
                     )
                 )
             )
-            return
-
-        # 處理批准/拒絕
-        if text.startswith("批准換班:") or text.startswith("拒絕換班:"):
-            action, req_id = text.split(":", 1)
-            req = shift_requests.get(req_id)
-            if not req:
+            
+        elif text.startswith("批准換班:") or text.startswith("拒絕換班:"):
+            # 處理換班回應
+            parts = text.split(":", 1)
+            if len(parts) != 2:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text="無效的回應格式")
+                )
+                return
+                
+            action, request_id = parts
+            request = shift_requests.get(request_id)
+            
+            if not request:
                 line_bot_api.reply_message(
                     event.reply_token,
                     TextSendMessage(text="找不到對應的換班請求，可能已過期或已處理")
                 )
                 return
-            if req["status"] != "pending":
+                
+            if request["target_id"] != user_id:
                 line_bot_api.reply_message(
                     event.reply_token,
-                    TextSendMessage(text="此換班請求已處理過，請勿重複操作")
+                    TextSendMessage(text="您無權回應此換班請求")
                 )
                 return
-
+                
             if action == "批准換班":
-                req["status"] = "approved"
-                ok = swap_shifts(
-                    req["date"],
-                    req["time"],
-                    req["requester_name"],
-                    req["target_name"]
+                # 更新請求狀態
+                request["status"] = "approved"
+                
+                # 更新 Google Calendar
+                success = swap_shifts(
+                    request["date"], 
+                    request["time"], 
+                    request["requester_name"], 
+                    request["target_name"]
                 )
-                line_bot_api.reply_message(
-                    event.reply_token,
-                    TextSendMessage(
-                        text=(
-                            "已批准換班並更新 Calendar"
-                            if ok else
-                            "已批准，但更新 Calendar 失敗"
-                        )
+                
+                # 回覆目標用戶
+                if success:
+                    line_bot_api.reply_message(
+                        event.reply_token,
+                        TextSendMessage(text="您已批准換班請求，Google Calendar 已更新")
                     )
-                )
+                else:
+                    line_bot_api.reply_message(
+                        event.reply_token,
+                        TextSendMessage(text="您已批准換班請求，但 Google Calendar 更新失敗，請聯繫管理員")
+                    )
+                
+                # 通知請求者
                 line_bot_api.push_message(
-                    req["requester_id"],
-                    TextSendMessage(
-                        text=f"{req['target_name']} 已批准您在 {req['date']} {req['time']} 的換班請求"
-                    )
+                    request["requester_id"],
+                    TextSendMessage(text=f"{request['target_name']} 已批准您在 {request['date']} {request['time']} 的換班請求")
                 )
-            else:
-                req["status"] = "rejected"
+            else:  # 拒絕換班
+                # 更新請求狀態
+                request["status"] = "rejected"
+                
+                # 回覆目標用戶
                 line_bot_api.reply_message(
                     event.reply_token,
                     TextSendMessage(text="您已拒絕換班請求")
                 )
+                
+                # 通知請求者
                 line_bot_api.push_message(
-                    req["requester_id"],
-                    TextSendMessage(
-                        text=f"{req['target_name']} 已拒絕您在 {req['date']} {req['time']} 的換班請求"
-                    )
+                    request["requester_id"],
+                    TextSendMessage(text=f"{request['target_name']} 已拒絕您在 {request['date']} {request['time']} 的換班請求")
                 )
-
-            shift_requests.pop(req_id, None)
-            return
-
+        elif text == "查看用戶映射":
+            # 管理員功能：查看當前用戶映射
+            mapping_text = "\n".join([f"{name}: {id}" for name, id in user_mapping.items()])
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=f"當前用戶映射:\n{mapping_text}")
+            )
+        elif text == "測試日曆":
+            # 測試 Google Calendar 連接
+            service = get_calendar_service()
+            if service:
+                try:
+                    # 嘗試列出未來 10 個事件
+                    now = datetime.utcnow().isoformat() + 'Z'
+                    events_result = service.events().list(
+                        calendarId=GOOGLE_CALENDAR_ID,
+                        timeMin=now,
+                        maxResults=10,
+                        singleEvents=True,
+                        orderBy='startTime'
+                    ).execute()
+                    events = events_result.get('items', [])
+                    
+                    if not events:
+                        line_bot_api.reply_message(
+                            event.reply_token,
+                            TextSendMessage(text="Google Calendar 連接成功，但未找到未來事件")
+                        )
+                    else:
+                        events_text = "\n".join([
+                            f"{event['summary']} ({event['start'].get('dateTime', event['start'].get('date'))})"
+                            for event in events
+                        ])
+                        line_bot_api.reply_message(
+                            event.reply_token,
+                            TextSendMessage(text=f"Google Calendar 連接成功，找到以下事件:\n{events_text}")
+                        )
+                except Exception as e:
+                    line_bot_api.reply_message(
+                        event.reply_token,
+                        TextSendMessage(text=f"Google Calendar 連接成功，但查詢事件時發生錯誤: {str(e)}")
+                    )
+            else:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text="Google Calendar 連接失敗，請檢查服務帳號憑證和日曆 ID 設定")
+                )
+        else:
+            # 提示正確的換班請求格式
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="請使用正確的換班請求格式：\n我希望在YYYYMMDD HH:MM (24小時制)跟你換班 @用戶名\n\n例如：\n我希望在20250530 08:00跟你換班 @張書豪-Ragic Customize!\n\n或者輸入「查看用戶映射」查看已知用戶\n輸入「測試日曆」測試 Google Calendar 連接")
+            )
     except Exception as e:
-        print(f"處理訊息時發生錯誤: {e}")
+        print(f"處理訊息時發生錯誤: {str(e)}")
+        # 發送錯誤訊息給用戶
         try:
             line_bot_api.reply_message(
                 event.reply_token,
-                TextSendMessage(text="處理您的請求時發生錯誤，請稍後再試。")
+                TextSendMessage(text=f"處理您的請求時發生錯誤，請稍後再試。錯誤詳情: {str(e)}")
             )
-        except:
-            pass
+        except Exception:
+            pass  # 忽略回覆錯誤
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT","10000"))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
+    port = int(os.getenv("PORT", "10000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
