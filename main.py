@@ -22,6 +22,8 @@ from googleapiclient.errors import HttpError
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "")
+created_calendar_events = set()
+
 
 # 確認環境變數已設置
 if not LINE_CHANNEL_SECRET or not LINE_CHANNEL_ACCESS_TOKEN:
@@ -428,7 +430,19 @@ def handle_message(event):
             if action == "批准換班":
                 # 更新請求狀態
                 request["status"] = "approved"
-                
+                cal_key = request_id   # request_id 一定唯一
+                if cal_key not in created_calendar_events:
+                    # 請用你現有的 Google Calendar 新增事件函式
+                    success = add_event_to_google_calendar(
+                        request["date"],
+                        request["time"],
+                        request["requester_name"],
+                        request["target_name"]
+                    )
+                    if success:
+                        created_calendar_events.add(cal_key)
+                else:
+                    print("該換班事件已同步過 Google Calendar，不再重複建立")
                 # 更新 Google Calendar
                 success = swap_shifts(
                     request["date"], 
