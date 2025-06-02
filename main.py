@@ -1399,7 +1399,7 @@ def handle_text_message(event):
                                 line_bot_api.reply_message,
                                 reply_token,
                                 flex_message,
-                                event_source=event.source
+                                
                             )
                         except Exception as e:
                             print(f"創建 Flex Message 時發生錯誤: {str(e)}")
