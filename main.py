@@ -14,7 +14,7 @@ from linebot.models import (
     TemplateSendMessage, ConfirmTemplate, MessageAction,
     FlexSendMessage, BubbleContainer, BoxComponent,
     TextComponent, ButtonComponent, SeparatorComponent,
-    URIAction
+    URIAction, ImageComponent, IconComponent
 )
 import google.oauth2.service_account
 from googleapiclient.discovery import build
@@ -479,22 +479,24 @@ def create_batch_shifts(user_name):
         success_count = 0
         skipped_count = 0
         failed_count = 0
-        result_messages = []
+        processed_dates = []
         
-        for i in range(1, 8):  # 從明天開始，共7天
-            current_date = today + timedelta(days=i)
+        # 處理未來 7 天
+        for i in range(1, 8):
+            # 計算目標日期
+            target_date = today + timedelta(days=i)
             
             # 跳過週六和週日
-            if current_date.weekday() >= 5:  # 5=週六, 6=週日
+            if target_date.weekday() >= 5:  # 5=週六, 6=週日
                 continue
-            
-            # 格式化日期和時間
-            date_str = current_date.strftime("%Y%m%d")
-            time_str = "09:00"  # 默認早上9點
+                
+            # 格式化日期
+            date_str = target_date.strftime("%Y%m%d")
+            formatted_date = target_date.strftime("%Y/%m/%d")
             
             # 檢查是否已有排班
             events = get_calendar_events(date_str)
-            has_event_at_time = False
+            has_event_at_9am = False
             
             if events:
                 for event in events:
@@ -502,42 +504,49 @@ def create_batch_shifts(user_name):
                     if start:
                         event_time = datetime.fromisoformat(start.replace('Z', '+00:00'))
                         if event_time.hour == 9 and event_time.minute == 0:
-                            has_event_at_time = True
-                            skipped_count += 1
-                            result_messages.append(f"{current_date.strftime('%Y/%m/%d')} 已有排班，跳過")
+                            has_event_at_9am = True
                             break
             
-            # 如果沒有排班，則創建新排班
-            if not has_event_at_time:
-                success = create_or_update_event(date_str, time_str, user_name, 
-                                               f"排班人員: {user_name}\n批次排班: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+            # 如果 9:00 沒有排班，則創建新排班
+            if not has_event_at_9am:
+                success = create_or_update_event(
+                    date_str, 
+                    "09:00", 
+                    user_name, 
+                    f"排班人員: {user_name}\n批次排班: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                )
+                
                 if success:
                     success_count += 1
-                    result_messages.append(f"{current_date.strftime('%Y/%m/%d')} 排班成功")
+                    processed_dates.append(formatted_date)
                 else:
                     failed_count += 1
-                    result_messages.append(f"{current_date.strftime('%Y/%m/%d')} 排班失敗")
+            else:
+                skipped_count += 1
         
         # 生成結果訊息
-        summary = f"批次排班結果：\n成功: {success_count}\n已有排班: {skipped_count}\n失敗: {failed_count}"
-        details = "\n".join(result_messages)
-        
-        return True, f"{summary}\n\n詳細結果:\n{details}"
+        if success_count > 0:
+            dates_str = ", ".join(processed_dates)
+            result = f"批次排班成功！\n為 {user_name} 在以下日期新增了 09:00 的排班:\n{dates_str}\n\n成功: {success_count}, 跳過(已有排班): {skipped_count}, 失敗: {failed_count}"
+        else:
+            result = f"未新增任何排班。\n跳過(已有排班): {skipped_count}, 失敗: {failed_count}"
+            
+        return True, result
     except Exception as e:
         print(f"批次創建排班時發生錯誤: {str(e)}")
-        return False, f"批次排班時發生錯誤: {str(e)}"
+        return False, f"批次排班失敗: {str(e)}"
 
+# ====== 權限檢查 ======
 def is_admin(user_id):
     """檢查用戶是否為管理員"""
-    # 這裡可以實現更複雜的管理員檢查邏輯
-    # 目前簡單地檢查用戶是否在用戶映射表中
-    for name, id in user_mapping.items():
-        if id == user_id:
-            return True
-    return False
+    # 在實際應用中，您可能需要從數據庫或配置文件中讀取管理員列表
+    # 這裡簡單地假設所有已知用戶都是管理員
+    return user_id in user_mapping.values()
 
-# ====== FastAPI 設定 ======
+# ====== FastAPI 應用 ======
 app = FastAPI()
+
+# 添加 CORS 中間件
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -548,53 +557,67 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    return {"status": "running", "message": "LINE Bot 換班系統已啟動"}
+    return {"message": "LINE Bot 服務正在運行"}
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    # 獲取 X-Line-Signature 標頭值
+    # 獲取請求頭和請求體
     signature = request.headers.get("X-Line-Signature", "")
-    request_id = request.headers.get("x-line-request-id", "")
-    
-    # 獲取請求體作為文本
     body = await request.body()
     body_text = body.decode("utf-8")
     
+    # 生成請求 ID
+    request_id = request.headers.get("X-Line-Request-ID", "unknown")
+    
     # 檢查是否為重複請求
     if is_duplicate_webhook(request_id, body_text):
-        print(f"跳過重複的 webhook 請求: {request_id}")
-        return JSONResponse(content={"status": "skipped", "message": "Duplicate request"})
+        return JSONResponse(content={"message": "Duplicate webhook request"})
+    
+    print(f"收到 webhook 請求: {request_id}")
     
     try:
-        # 驗證簽名
+        # 處理 webhook 事件
         handler.handle(body_text, signature)
+        
+        # 返回成功響應
+        return JSONResponse(content={"message": "OK"})
     except InvalidSignatureError:
+        print("無效的簽名")
         raise HTTPException(status_code=400, detail="Invalid signature")
-    
-    # 即使處理過程中出錯，也返回 200 OK 給 LINE 平台
-    return JSONResponse(content={"status": "ok"})
+    except Exception as e:
+        print(f"處理 webhook 時發生錯誤: {str(e)}")
+        # 即使出錯也返回 200，避免 LINE 重試
+        return JSONResponse(content={"message": f"Error: {str(e)}"})
 
-# ====== LINE 訊息處理 ======
+# ====== LINE Bot 事件處理 ======
 @handler.add(MessageEvent, message=TextMessage)
-def handle_message(event):
+def handle_text_message(event):
+    # 獲取用戶訊息
+    text = event.message.text.strip()
+    reply_token = event.reply_token
+    user_id = event.source.user_id
+    
     try:
-        user_id = event.source.user_id
-        text = event.message.text
-        reply_token = event.reply_token
+        # 獲取用戶資料
+        user_profile = line_bot_api.get_profile(user_id)
+        user_name = user_profile.display_name
         
-        # 嘗試獲取用戶資料
-        try:
-            user_profile = line_bot_api.get_profile(user_id)
-            user_name = user_profile.display_name
-            # 更新用戶映射
-            user_mapping[user_name] = user_id
-            print(f"用戶映射更新: {user_name} -> {user_id}")
-        except LineBotApiError:
-            user_name = "未知用戶"
+        # 更新用戶映射
+        if user_name not in user_mapping.values():
+            # 檢查是否已有此用戶的映射
+            existing_key = None
+            for k, v in user_mapping.items():
+                if v == user_id:
+                    existing_key = k
+                    break
+            
+            if not existing_key:
+                # 如果沒有此用戶的映射，添加新映射
+                user_mapping[user_name] = user_id
+                print(f"用戶映射更新: {user_name} -> {user_id}")
         
-        # 檢查是否為換班請求
-        match = re.match(SHIFT_REQUEST_PATTERN, text)
-        if match:
+        # 處理換班請求
+        if match := re.match(SHIFT_REQUEST_PATTERN, text):
             date_str, hour, minute, target_user = match.groups()
             
             # 驗證日期格式
@@ -929,26 +952,157 @@ def handle_message(event):
                                     events_by_date[date_str] = []
                                 
                                 summary = event.get('summary', '未知班表')
-                                events_by_date[date_str].append(f"{time_str} - {summary}")
+                                user_name = summary.replace('班表: ', '')
+                                events_by_date[date_str].append({
+                                    'time': time_str,
+                                    'user': user_name
+                                })
                         
+                        # 創建 Flex Message 表格
+                        flex_contents = []
+                        
+                        # 添加標題
+                        flex_contents.append({
+                            "type": "box",
+                            "layout": "vertical",
+                            "contents": [
+                                {
+                                    "type": "text",
+                                    "text": "未來一週排班表",
+                                    "weight": "bold",
+                                    "size": "xl",
+                                    "color": "#1DB446",
+                                    "align": "center"
+                                },
+                                {
+                                    "type": "separator",
+                                    "margin": "md"
+                                }
+                            ]
+                        })
+                        
+                        # 添加每天的排班
+                        for date_str in sorted(events_by_date.keys()):
+                            # 添加日期標題
+                            date_box = {
+                                "type": "box",
+                                "layout": "vertical",
+                                "margin": "md",
+                                "contents": [
+                                    {
+                                        "type": "text",
+                                        "text": date_str,
+                                        "weight": "bold",
+                                        "size": "lg",
+                                        "color": "#555555"
+                                    }
+                                ]
+                            }
+                            flex_contents.append(date_box)
+                            
+                            # 添加表頭
+                            header_box = {
+                                "type": "box",
+                                "layout": "horizontal",
+                                "margin": "sm",
+                                "contents": [
+                                    {
+                                        "type": "text",
+                                        "text": "時間",
+                                        "size": "sm",
+                                        "color": "#aaaaaa",
+                                        "flex": 2
+                                    },
+                                    {
+                                        "type": "text",
+                                        "text": "人員",
+                                        "size": "sm",
+                                        "color": "#aaaaaa",
+                                        "flex": 5
+                                    }
+                                ]
+                            }
+                            flex_contents.append(header_box)
+                            
+                            # 添加排班項目
+                            for event in sorted(events_by_date[date_str], key=lambda x: x['time']):
+                                event_box = {
+                                    "type": "box",
+                                    "layout": "horizontal",
+                                    "contents": [
+                                        {
+                                            "type": "text",
+                                            "text": event['time'],
+                                            "size": "sm",
+                                            "color": "#555555",
+                                            "flex": 2
+                                        },
+                                        {
+                                            "type": "text",
+                                            "text": event['user'],
+                                            "size": "sm",
+                                            "color": "#555555",
+                                            "flex": 5,
+                                            "wrap": True
+                                        }
+                                    ]
+                                }
+                                flex_contents.append(event_box)
+                            
+                            # 添加分隔線
+                            flex_contents.append({
+                                "type": "separator",
+                                "margin": "md"
+                            })
+                        
+                        # 創建 Flex Message
+                        bubble = {
+                            "type": "bubble",
+                            "body": {
+                                "type": "box",
+                                "layout": "vertical",
+                                "contents": flex_contents
+                            },
+                            "styles": {
+                                "footer": {
+                                    "separator": True
+                                }
+                            }
+                        }
+                        
+                        # 發送 Flex Message
+                        flex_message = FlexSendMessage(
+                            alt_text="未來一週排班表",
+                            contents=bubble
+                        )
+                        
+                        safe_send_message(
+                            line_bot_api.reply_message,
+                            reply_token,
+                            flex_message
+                        )
+                except Exception as e:
+                    print(f"創建 Flex Message 時發生錯誤: {str(e)}")
+                    # 如果 Flex Message 創建失敗，回退到純文字模式
+                    try:
                         # 生成排班列表
                         result = ["未來一週排班表:"]
                         for date_str in sorted(events_by_date.keys()):
                             result.append(f"\n【{date_str}】")
-                            for event_str in sorted(events_by_date[date_str]):
-                                result.append(event_str)
+                            for event in sorted(events_by_date[date_str], key=lambda x: x['time']):
+                                result.append(f"{event['time']} - {event['user']}")
                         
                         safe_send_message(
                             line_bot_api.reply_message,
                             reply_token,
                             TextSendMessage(text="\n".join(result))
                         )
-                except Exception as e:
-                    safe_send_message(
-                        line_bot_api.reply_message,
-                        reply_token,
-                        TextSendMessage(text=f"Google Calendar 連接成功，但查詢事件時發生錯誤: {str(e)}")
-                    )
+                    except Exception as text_error:
+                        safe_send_message(
+                            line_bot_api.reply_message,
+                            reply_token,
+                            TextSendMessage(text=f"Google Calendar 連接成功，但處理事件時發生錯誤: {str(e)}\n回退到文字模式也失敗: {str(text_error)}")
+                        )
             else:
                 safe_send_message(
                     line_bot_api.reply_message,
@@ -1004,25 +1158,19 @@ def handle_message(event):
             )
             
         else:
-            # 提示正確的指令格式
+            # 未知指令，顯示幫助訊息
             safe_send_message(
                 line_bot_api.reply_message,
                 reply_token,
-                TextSendMessage(text="無法識別的指令。請輸入「幫助」查看可用指令列表。")
+                TextSendMessage(text="未知指令，請輸入「幫助」查看可用指令")
             )
-    except Exception as e:
+            
+    except LineBotApiError as e:
         print(f"處理訊息時發生錯誤: {str(e)}")
-        # 發送錯誤訊息給用戶
-        try:
-            safe_send_message(
-                line_bot_api.reply_message,
-                event.reply_token,
-                TextSendMessage(text=f"處理您的請求時發生錯誤，請稍後再試。錯誤詳情: {str(e)}")
-            )
-        except Exception:
-            pass  # 忽略回覆錯誤
+    except Exception as e:
+        print(f"處理訊息時發生未知錯誤: {str(e)}")
 
+# ====== 啟動應用 ======
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", "10000"))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run(app, host="0.0.0.0", port=10000)
