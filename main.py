@@ -1417,7 +1417,8 @@ def handle_text_message(event):
                             fallback_message = "\n".join(result)
 
                             try:
-                                line_bot_api.push_message(
+                                safe_send_message(
+                                    line_bot_api.push_message,
                                     user_id,
                                     TextSendMessage(text=fallback_message)
                                 )
