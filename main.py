@@ -1418,28 +1418,9 @@ def handle_text_message(event):
                             )
                         except Exception as e:
                             print(f"Flex Message 發送錯誤：{str(e)}")
-                            # 如果 Flex Message 創建失敗，回退到純文字模式
+                            # 這裡不做任何補述，也不推送備援文字
                             
-                            # 生成排班列表（純文字備援）
-                        result = ["[備援文字] 未來一週排班表:"]
-                        for date_str in sorted(events_by_date.keys()):
-                            result.append(f"\n【{date_str}】")
-                            for event in sorted(events_by_date[date_str], key=lambda x: x['time']):
-                                result.append(f"{event['time']} - {event['user']}")
-                                
-                            # ✅ 加上唯一時間標籤，避免被判定為重複訊息
-                            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            result.append(f"\n(產生時間: {timestamp})")
-                            fallback_message = "\n".join(result)
 
-                            try:
-                                safe_send_message(
-                                    line_bot_api.push_message,
-                                    user_id,
-                                    TextSendMessage(text=fallback_message)
-                                )
-                            except Exception as push_err:
-                                print(f"推送備援文字時發生錯誤: {push_err}")
                                 
                 except Exception as e:
                     try:
