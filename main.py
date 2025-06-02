@@ -733,7 +733,7 @@ def handle_text_message(event):
     reply_token = event.reply_token
     user_id = event.source.user_id
     
-   try:
+    try:
         # 獲取用戶資料
         user_profile = line_bot_api.get_profile(user_id)
         user_name = user_profile.display_name
