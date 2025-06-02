@@ -55,7 +55,7 @@ def init_database():
     """初始化資料庫"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    
+
     # 創建用戶表
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS users (
@@ -66,7 +66,7 @@ def init_database():
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     ''')
-    
+
     # 創建換班請求表
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS shift_requests (
@@ -83,17 +83,11 @@ def init_database():
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     ''')
-    
-    # 導入初始用戶數據
-    for name, line_id in INITIAL_USER_MAPPING.items():
-        cursor.execute(
-            "INSERT OR IGNORE INTO users (line_id, display_name) VALUES (?, ?)",
-            (line_id, name)
-        )
-    
+
     conn.commit()
     conn.close()
     print(f"資料庫初始化完成: {DB_FILE}")
+
 
 # 初始化資料庫
 init_database()
