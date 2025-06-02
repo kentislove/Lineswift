@@ -272,64 +272,80 @@ def clean_expired_records(records_dict, expiry_seconds):
         del records_dict[key]
 
 def safe_send_message(method, *args, **kwargs):
-    """安全發送訊息，避免重複發送"""
-    # 提取用戶 ID 和訊息內容
+    """
+    安全發送訊息，避免重複發送。  
+    改寫要點：  
+    1. 直接用 event.source.user_id 當 user_id，不要再把 reply_token 當成 user_id。
+    2. 如果捕捉到 Invalid reply token，就 fallback 一次 push_message，然後 return，而不要 re-raise Exception。
+    """
     user_id = None
     message_text = None
-    
+
+    # 先從 kwargs 裡取 event_source（handler.handle 會傳 event_source=event.source）
+    event_source = kwargs.get("event_source", None)
+    if event_source and hasattr(event_source, "user_id"):
+        user_id = event_source.user_id
+
+    # 判斷要送的是 reply_message 還是 push_message
     if method == line_bot_api.reply_message:
-        # reply_message(reply_token, messages)
-        message_obj = args[1]
-        if isinstance(message_obj, list):
-            message_obj = message_obj[0]
-        if hasattr(message_obj, 'text'):
-            message_text = message_obj.text
-        # 對於 reply_message，我們使用 reply_token 作為用戶標識
-        user_id = args[0]
+        # args[0] 應該是 reply_token
+        # args[1] 可能是 TextSendMessage、TemplateSendMessage、FlexSendMessage...
+        # 若是 TextSendMessage，可以取 text；否則我們後面再 fallback push，所以這裡先嘗試擷取：
+        msg_obj = args[1]
+        if isinstance(msg_obj, TextSendMessage) and hasattr(msg_obj, 'text'):
+            message_text = msg_obj.text
     elif method == line_bot_api.push_message:
-        # push_message(to, messages)
+        # args[0] 是 userId，args[1] 是 message 物件
+        msg_obj = args[1]
+        if isinstance(msg_obj, TextSendMessage) and hasattr(msg_obj, 'text'):
+            message_text = msg_obj.text
+        # user_id 就直接用 args[0]
         user_id = args[0]
-        message_obj = args[1]
-        if isinstance(message_obj, list):
-            message_obj = message_obj[0]
-        if hasattr(message_obj, 'text'):
-            message_text = message_obj.text
-    
-    # 如果無法提取訊息內容，直接發送
+
+    # 如果沒有 user_id，就直接執行，不做去重判斷
     if not user_id or not message_text:
-        return method(*args, **kwargs)
-    
-    # 檢查是否重複發送
-    if is_duplicate_message(user_id, message_text):
-        print(f"跳過重複訊息: {message_text[:30]}...")
-        return None
-    
-    # 發送訊息
+        try:
+            return method(*args, **kwargs)
+        except LineBotApiError as e:
+            # 若是推播失敗也不要影響下游
+            print(f"訊息推送失敗 (no user_id or no message_text)：{str(e)}")
+            return None
+
+    # 去重機制：檢查 message_hash
+    # 這裡改用 user_id + message_text 來算 hash
+    message_hash = generate_hash(f"{user_id}_{message_text}")
+    if message_hash in sent_messages:
+        last_time = sent_messages[message_hash]
+        if time.time() - last_time < MESSAGE_EXPIRY:
+            print(f"跳過重複訊息: {message_text[:30]}...")
+            return None
+    # 紀錄一次
+    sent_messages[message_hash] = time.time()
+    clean_expired_records(sent_messages, MESSAGE_EXPIRY)
+
+    # 真正送訊息
     try:
         return method(*args, **kwargs)
     except LineBotApiError as e:
-        print(f"發送訊息時發生錯誤: {str(e)}")
-        
-        # 如果是 reply token 無效的錯誤，嘗試使用 push message
-        if "Invalid reply token" in str(e) and method == line_bot_api.reply_message:
-            print("嘗試使用 push message 替代 reply message")
-            
-            # 從 event 中獲取用戶 ID
-            event_source = kwargs.get("event_source")
-            if event_source and hasattr(event_source, "user_id"):
-                user_id = event_source.user_id
-                
-                # 使用 push message 發送訊息
-                try:
-                    return line_bot_api.push_message(user_id, args[1])
-                except Exception as push_error:
-                    print(f"使用 push message 發送訊息時發生錯誤: {str(push_error)}")
-        
-        # 如果發送失敗，從記錄中移除此訊息
-        message_hash = generate_hash(f"{user_id}_{message_text}")
-        if message_hash in sent_messages:
-            del sent_messages[message_hash]
-        raise
+        err_str = str(e)
+        print(f"發送訊息時發生錯誤: {err_str}")
+
+        # 如果是 "Invalid reply token" 且原本用的是 reply_message，就改用 push_message
+        if "Invalid reply token" in err_str and method == line_bot_api.reply_message:
+            print("reply_token 無效，改用 push_message 傳送")
+
+            # 重新組成 push_message 的 args：user_id, messages
+            msg_obj = args[1]  # e.g. TextSendMessage or FlexSendMessage
+            try:
+                line_bot_api.push_message(user_id, msg_obj)
+            except Exception as push_err:
+                print(f"fallback push_message 也發生錯誤：{str(push_err)}")
+            # 不要再把例外拋出去，直接 return，以免被 webhook 端誤判失敗
+            return None
+
+        # 如果是其他錯誤，或原本就不是 reply_message，直接 return None
+        return None
+
 
 # ====== Google Calendar API 設定 ======
 def get_calendar_service():
