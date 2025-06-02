@@ -3,6 +3,7 @@ import re
 import json
 import hashlib
 import time
+import sqlite3
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -46,18 +47,137 @@ ADD_SHIFT_PATTERN = r"新增排班\s+(\d{8})\s+(\d{2}):(\d{2})\s*@(.+)"
 # 匹配格式: "批次排班 @用戶名"
 BATCH_SHIFT_PATTERN = r"批次排班\s*@(.+)"
 
-# ====== 用戶管理 ======
-# 初始化用戶映射表 - 預設已知用戶的名稱與 LINE ID 對應關係
-# 格式: {"用戶名稱": "LINE_USER_ID"}
-# 注意: 請將以下示例替換為您實際的用戶名稱和 LINE ID
-INITIAL_USER_MAPPING = {
-    "張書豪-Ragic Customize!": "Uf15abf85bca4ee133d1027593de4d1ad",
-    "KentChang-廠內維修中": "Ub2eb02fea865d917854d6ecaace84c70",
-    # 可以添加更多用戶
-}
+# ====== 資料庫設定 ======
+# 資料庫檔案路徑
+DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "line_bot.db")
+
+def init_database():
+    """初始化資料庫"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    # 創建用戶表
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        line_id TEXT UNIQUE NOT NULL,
+        display_name TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    # 創建換班請求表
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS shift_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        request_id TEXT UNIQUE NOT NULL,
+        requester_id TEXT NOT NULL,
+        requester_name TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        target_name TEXT NOT NULL,
+        date TEXT NOT NULL,
+        time TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    # 導入初始用戶數據
+    for name, line_id in INITIAL_USER_MAPPING.items():
+        cursor.execute(
+            "INSERT OR IGNORE INTO users (line_id, display_name) VALUES (?, ?)",
+            (line_id, name)
+        )
+    
+    conn.commit()
+    conn.close()
+    print(f"資料庫初始化完成: {DB_FILE}")
+
+# 初始化資料庫
+init_database()
+
+def get_user_mapping_from_db():
+    """從資料庫獲取用戶映射"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT display_name, line_id FROM users")
+    results = cursor.fetchall()
+    
+    conn.close()
+    
+    # 轉換為字典
+    return {name: line_id for name, line_id in results}
+
+def save_user_to_db(line_id, display_name):
+    """將用戶保存到資料庫"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    try:
+        # 檢查用戶是否已存在
+        cursor.execute("SELECT id FROM users WHERE line_id = ?", (line_id,))
+        user = cursor.fetchone()
+        
+        if user:
+            # 更新用戶名稱
+            cursor.execute(
+                "UPDATE users SET display_name = ?, updated_at = CURRENT_TIMESTAMP WHERE line_id = ?",
+                (display_name, line_id)
+            )
+            print(f"用戶資料已更新: {display_name} ({line_id})")
+        else:
+            # 新增用戶
+            cursor.execute(
+                "INSERT INTO users (line_id, display_name) VALUES (?, ?)",
+                (line_id, display_name)
+            )
+            print(f"新用戶已記錄: {display_name} ({line_id})")
+        
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"保存用戶到資料庫時發生錯誤: {str(e)}")
+        return False
+    finally:
+        conn.close()
+
+def save_shift_request_to_db(request_data):
+    """將換班請求保存到資料庫"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO shift_requests 
+            (request_id, requester_id, requester_name, target_id, target_name, date, time, status, updated_at) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            (
+                request_data["request_id"],
+                request_data["requester_id"],
+                request_data["requester_name"],
+                request_data["target_id"],
+                request_data["target_name"],
+                request_data["date"],
+                request_data["time"],
+                request_data["status"]
+            )
+        )
+        
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"保存換班請求到資料庫時發生錯誤: {str(e)}")
+        return False
+    finally:
+        conn.close()
 
 # 用於存儲用戶名稱與 LINE ID 的對應關係
-user_mapping = INITIAL_USER_MAPPING.copy()
+user_mapping = get_user_mapping_from_db()
 
 # 用於存儲換班請求
 shift_requests = {}
@@ -193,8 +313,24 @@ def safe_send_message(method, *args, **kwargs):
     # 發送訊息
     try:
         return method(*args, **kwargs)
-    except Exception as e:
+    except LineBotApiError as e:
         print(f"發送訊息時發生錯誤: {str(e)}")
+        
+        # 如果是 reply token 無效的錯誤，嘗試使用 push message
+        if "Invalid reply token" in str(e) and method == line_bot_api.reply_message:
+            print("嘗試使用 push message 替代 reply message")
+            
+            # 從 event 中獲取用戶 ID
+            event_source = kwargs.get("event_source")
+            if event_source and hasattr(event_source, "user_id"):
+                user_id = event_source.user_id
+                
+                # 使用 push message 發送訊息
+                try:
+                    return line_bot_api.push_message(user_id, args[1])
+                except Exception as push_error:
+                    print(f"使用 push message 發送訊息時發生錯誤: {str(push_error)}")
+        
         # 如果發送失敗，從記錄中移除此訊息
         message_hash = generate_hash(f"{user_id}_{message_text}")
         if message_hash in sent_messages:
@@ -602,8 +738,8 @@ def handle_text_message(event):
         user_profile = line_bot_api.get_profile(user_id)
         user_name = user_profile.display_name
         
-        # 更新用戶映射
-        if user_name not in user_mapping.values():
+        # 更新用戶映射並保存到資料庫
+        if user_id not in user_mapping.values():
             # 檢查是否已有此用戶的映射
             existing_key = None
             for k, v in user_mapping.items():
@@ -614,7 +750,9 @@ def handle_text_message(event):
             if not existing_key:
                 # 如果沒有此用戶的映射，添加新映射
                 user_mapping[user_name] = user_id
-                print(f"用戶映射更新: {user_name} -> {user_id}")
+                # 保存到資料庫
+                save_user_to_db(user_id, user_name)
+                print(f"新用戶已記錄: {user_name} ({user_id})")
         
         # 處理換班請求
         if match := re.match(SHIFT_REQUEST_PATTERN, text):
@@ -625,11 +763,19 @@ def handle_text_message(event):
                 date = datetime.strptime(date_str, "%Y%m%d")
                 formatted_date = date.strftime("%Y/%m/%d")
             except ValueError:
-                safe_send_message(
-                    line_bot_api.reply_message,
-                    reply_token,
-                    TextSendMessage(text="日期格式錯誤，請使用YYYYMMDD格式，例如：20250530")
-                )
+                try:
+                    safe_send_message(
+                        line_bot_api.reply_message,
+                        reply_token,
+                        TextSendMessage(text="日期格式錯誤，請使用YYYYMMDD格式，例如：20250530"),
+                        event_source=event.source
+                    )
+                except Exception as e:
+                    # 如果回覆失敗，嘗試直接推送訊息
+                    line_bot_api.push_message(
+                        user_id,
+                        TextSendMessage(text="日期格式錯誤，請使用YYYYMMDD格式，例如：20250530")
+                    )
                 return
             
             # 驗證時間格式
@@ -640,11 +786,19 @@ def handle_text_message(event):
                     raise ValueError("時間格式錯誤")
                 formatted_time = f"{hour}:{minute}"
             except ValueError:
-                safe_send_message(
-                    line_bot_api.reply_message,
-                    reply_token,
-                    TextSendMessage(text="時間格式錯誤，請使用24小時制，例如：08:00 或 18:30")
-                )
+                try:
+                    safe_send_message(
+                        line_bot_api.reply_message,
+                        reply_token,
+                        TextSendMessage(text="時間格式錯誤，請使用24小時制，例如：08:00 或 18:30"),
+                        event_source=event.source
+                    )
+                except Exception as e:
+                    # 如果回覆失敗，嘗試直接推送訊息
+                    line_bot_api.push_message(
+                        user_id,
+                        TextSendMessage(text="時間格式錯誤，請使用24小時制，例如：08:00 或 18:30")
+                    )
                 return
             
             # 檢查目標用戶是否存在
@@ -654,11 +808,19 @@ def handle_text_message(event):
                 known_users = list(user_mapping.keys())
                 user_list = "\n".join([f"- {name}" for name in known_users])
                 
-                safe_send_message(
-                    line_bot_api.reply_message,
-                    reply_token,
-                    TextSendMessage(text=f"找不到用戶 '{target_user}'，請確認用戶名稱正確。\n\n已知用戶列表:\n{user_list}")
-                )
+                try:
+                    safe_send_message(
+                        line_bot_api.reply_message,
+                        reply_token,
+                        TextSendMessage(text=f"找不到用戶 '{target_user}'，請確認用戶名稱正確。\n\n已知用戶列表:\n{user_list}"),
+                        event_source=event.source
+                    )
+                except Exception as e:
+                    # 如果回覆失敗，嘗試直接推送訊息
+                    line_bot_api.push_message(
+                        user_id,
+                        TextSendMessage(text=f"找不到用戶 '{target_user}'，請確認用戶名稱正確。\n\n已知用戶列表:\n{user_list}")
+                    )
                 return
             
             # 生成請求 ID
@@ -669,15 +831,24 @@ def handle_text_message(event):
                 # 如果是短時間內的重複請求，直接回覆
                 last_request_time = shift_requests[request_id].get("timestamp", 0)
                 if time.time() - last_request_time < 300:  # 5分鐘內的重複請求
-                    safe_send_message(
-                        line_bot_api.reply_message,
-                        reply_token,
-                        TextSendMessage(text=f"您已經發送過相同的換班請求給 {target_user}，請等待回應")
-                    )
+                    try:
+                        safe_send_message(
+                            line_bot_api.reply_message,
+                            reply_token,
+                            TextSendMessage(text=f"您已經發送過相同的換班請求給 {target_user}，請等待回應"),
+                            event_source=event.source
+                        )
+                    except Exception as e:
+                        # 如果回覆失敗，嘗試直接推送訊息
+                        line_bot_api.push_message(
+                            user_id,
+                            TextSendMessage(text=f"您已經發送過相同的換班請求給 {target_user}，請等待回應")
+                        )
                     return
             
             # 儲存換班請求
-            shift_requests[request_id] = {
+            request_data = {
+                "request_id": request_id,
                 "requester_id": user_id,
                 "requester_name": user_name,
                 "target_id": target_user_id,
@@ -688,12 +859,25 @@ def handle_text_message(event):
                 "timestamp": time.time()
             }
             
+            shift_requests[request_id] = request_data
+            
+            # 保存到資料庫
+            save_shift_request_to_db(request_data)
+            
             # 回覆請求者
-            safe_send_message(
-                line_bot_api.reply_message,
-                reply_token,
-                TextSendMessage(text=f"已發送換班請求給 {target_user}，等待回應...")
-            )
+            try:
+                safe_send_message(
+                    line_bot_api.reply_message,
+                    reply_token,
+                    TextSendMessage(text=f"已發送換班請求給 {target_user}，等待回應..."),
+                    event_source=event.source
+                )
+            except Exception as e:
+                # 如果回覆失敗，嘗試直接推送訊息
+                line_bot_api.push_message(
+                    user_id,
+                    TextSendMessage(text=f"已發送換班請求給 {target_user}，等待回應...")
+                )
             
             # 發送確認訊息給目標用戶
             confirm_message = f"換班請求\n{user_name} 希望在 {formatted_date} {formatted_time} 與您換班"
@@ -717,45 +901,80 @@ def handle_text_message(event):
             # 處理換班回應
             parts = text.split(":", 1)
             if len(parts) != 2:
-                safe_send_message(
-                    line_bot_api.reply_message,
-                    reply_token,
-                    TextSendMessage(text="無效的回應格式")
-                )
+                try:
+                    safe_send_message(
+                        line_bot_api.reply_message,
+                        reply_token,
+                        TextSendMessage(text="無效的回應格式"),
+                        event_source=event.source
+                    )
+                except Exception as e:
+                    # 如果回覆失敗，嘗試直接推送訊息
+                    line_bot_api.push_message(
+                        user_id,
+                        TextSendMessage(text="無效的回應格式")
+                    )
                 return
                 
             action, request_id = parts
             request = shift_requests.get(request_id)
             
             if not request:
-                safe_send_message(
-                    line_bot_api.reply_message,
-                    reply_token,
-                    TextSendMessage(text="找不到對應的換班請求，可能已過期或已處理")
-                )
+                try:
+                    safe_send_message(
+                        line_bot_api.reply_message,
+                        reply_token,
+                        TextSendMessage(text="找不到對應的換班請求，可能已過期或已處理"),
+                        event_source=event.source
+                    )
+                except Exception as e:
+                    # 如果回覆失敗，嘗試直接推送訊息
+                    line_bot_api.push_message(
+                        user_id,
+                        TextSendMessage(text="找不到對應的換班請求，可能已過期或已處理")
+                    )
                 return
                 
             if request["target_id"] != user_id:
-                safe_send_message(
-                    line_bot_api.reply_message,
-                    reply_token,
-                    TextSendMessage(text="您無權回應此換班請求")
-                )
+                try:
+                    safe_send_message(
+                        line_bot_api.reply_message,
+                        reply_token,
+                        TextSendMessage(text="您無權回應此換班請求"),
+                        event_source=event.source
+                    )
+                except Exception as e:
+                    # 如果回覆失敗，嘗試直接推送訊息
+                    line_bot_api.push_message(
+                        user_id,
+                        TextSendMessage(text="您無權回應此換班請求")
+                    )
                 return
                 
             # 檢查請求狀態，避免重複處理
             if request["status"] != "pending":
-                safe_send_message(
-                    line_bot_api.reply_message,
-                    reply_token,
-                    TextSendMessage(text=f"此換班請求已經被{request['status']}，無法重複處理")
-                )
+                try:
+                    safe_send_message(
+                        line_bot_api.reply_message,
+                        reply_token,
+                        TextSendMessage(text=f"此換班請求已經被{request['status']}，無法重複處理"),
+                        event_source=event.source
+                    )
+                except Exception as e:
+                    # 如果回覆失敗，嘗試直接推送訊息
+                    line_bot_api.push_message(
+                        user_id,
+                        TextSendMessage(text=f"此換班請求已經被{request['status']}，無法重複處理")
+                    )
                 return
                 
             if action == "批准換班":
                 # 更新請求狀態
                 request["status"] = "approved"
                 request["response_time"] = time.time()
+                
+                # 保存到資料庫
+                save_shift_request_to_db(request)
                 
                 # 更新 Google Calendar
                 success = swap_shifts(
@@ -767,17 +986,33 @@ def handle_text_message(event):
                 
                 # 回覆目標用戶
                 if success:
-                    safe_send_message(
-                        line_bot_api.reply_message,
-                        reply_token,
-                        TextSendMessage(text="您已批准換班請求，Google Calendar 已更新")
-                    )
+                    try:
+                        safe_send_message(
+                            line_bot_api.reply_message,
+                            reply_token,
+                            TextSendMessage(text="您已批准換班請求，Google Calendar 已更新"),
+                            event_source=event.source
+                        )
+                    except Exception as e:
+                        # 如果回覆失敗，嘗試直接推送訊息
+                        line_bot_api.push_message(
+                            user_id,
+                            TextSendMessage(text="您已批准換班請求，Google Calendar 已更新")
+                        )
                 else:
-                    safe_send_message(
-                        line_bot_api.reply_message,
-                        reply_token,
-                        TextSendMessage(text="您已批准換班請求，但 Google Calendar 更新失敗，請聯繫管理員")
-                    )
+                    try:
+                        safe_send_message(
+                            line_bot_api.reply_message,
+                            reply_token,
+                            TextSendMessage(text="您已批准換班請求，但 Google Calendar 更新失敗，請聯繫管理員"),
+                            event_source=event.source
+                        )
+                    except Exception as e:
+                        # 如果回覆失敗，嘗試直接推送訊息
+                        line_bot_api.push_message(
+                            user_id,
+                            TextSendMessage(text="您已批准換班請求，但 Google Calendar 更新失敗，請聯繫管理員")
+                        )
                 
                 # 通知請求者
                 safe_send_message(
@@ -790,12 +1025,23 @@ def handle_text_message(event):
                 request["status"] = "rejected"
                 request["response_time"] = time.time()
                 
+                # 保存到資料庫
+                save_shift_request_to_db(request)
+                
                 # 回覆目標用戶
-                safe_send_message(
-                    line_bot_api.reply_message,
-                    reply_token,
-                    TextSendMessage(text="您已拒絕換班請求")
-                )
+                try:
+                    safe_send_message(
+                        line_bot_api.reply_message,
+                        reply_token,
+                        TextSendMessage(text="您已拒絕換班請求"),
+                        event_source=event.source
+                    )
+                except Exception as e:
+                    # 如果回覆失敗，嘗試直接推送訊息
+                    line_bot_api.push_message(
+                        user_id,
+                        TextSendMessage(text="您已拒絕換班請求")
+                    )
                 
                 # 通知請求者
                 safe_send_message(
@@ -808,11 +1054,19 @@ def handle_text_message(event):
         elif match := re.match(ADD_SHIFT_PATTERN, text):
             # 檢查是否為管理員
             if not is_admin(user_id):
-                safe_send_message(
-                    line_bot_api.reply_message,
-                    reply_token,
-                    TextSendMessage(text="抱歉，只有管理員可以使用此功能")
-                )
+                try:
+                    safe_send_message(
+                        line_bot_api.reply_message,
+                        reply_token,
+                        TextSendMessage(text="抱歉，只有管理員可以使用此功能"),
+                        event_source=event.source
+                    )
+                except Exception as e:
+                    # 如果回覆失敗，嘗試直接推送訊息
+                    line_bot_api.push_message(
+                        user_id,
+                        TextSendMessage(text="抱歉，只有管理員可以使用此功能")
+                    )
                 return
                 
             date_str, hour, minute, target_user = match.groups()
@@ -822,11 +1076,19 @@ def handle_text_message(event):
                 date = datetime.strptime(date_str, "%Y%m%d")
                 formatted_date = date.strftime("%Y/%m/%d")
             except ValueError:
-                safe_send_message(
-                    line_bot_api.reply_message,
-                    reply_token,
-                    TextSendMessage(text="日期格式錯誤，請使用YYYYMMDD格式，例如：20250530")
-                )
+                try:
+                    safe_send_message(
+                        line_bot_api.reply_message,
+                        reply_token,
+                        TextSendMessage(text="日期格式錯誤，請使用YYYYMMDD格式，例如：20250530"),
+                        event_source=event.source
+                    )
+                except Exception as e:
+                    # 如果回覆失敗，嘗試直接推送訊息
+                    line_bot_api.push_message(
+                        user_id,
+                        TextSendMessage(text="日期格式錯誤，請使用YYYYMMDD格式，例如：20250530")
+                    )
                 return
             
             # 驗證時間格式
@@ -837,11 +1099,19 @@ def handle_text_message(event):
                     raise ValueError("時間格式錯誤")
                 formatted_time = f"{hour}:{minute}"
             except ValueError:
-                safe_send_message(
-                    line_bot_api.reply_message,
-                    reply_token,
-                    TextSendMessage(text="時間格式錯誤，請使用24小時制，例如：08:00 或 18:30")
-                )
+                try:
+                    safe_send_message(
+                        line_bot_api.reply_message,
+                        reply_token,
+                        TextSendMessage(text="時間格式錯誤，請使用24小時制，例如：08:00 或 18:30"),
+                        event_source=event.source
+                    )
+                except Exception as e:
+                    # 如果回覆失敗，嘗試直接推送訊息
+                    line_bot_api.push_message(
+                        user_id,
+                        TextSendMessage(text="時間格式錯誤，請使用24小時制，例如：08:00 或 18:30")
+                    )
                 return
             
             # 檢查目標用戶是否存在
@@ -850,11 +1120,19 @@ def handle_text_message(event):
                 known_users = list(user_mapping.keys())
                 user_list = "\n".join([f"- {name}" for name in known_users])
                 
-                safe_send_message(
-                    line_bot_api.reply_message,
-                    reply_token,
-                    TextSendMessage(text=f"找不到用戶 '{target_user}'，請確認用戶名稱正確。\n\n已知用戶列表:\n{user_list}")
-                )
+                try:
+                    safe_send_message(
+                        line_bot_api.reply_message,
+                        reply_token,
+                        TextSendMessage(text=f"找不到用戶 '{target_user}'，請確認用戶名稱正確。\n\n已知用戶列表:\n{user_list}"),
+                        event_source=event.source
+                    )
+                except Exception as e:
+                    # 如果回覆失敗，嘗試直接推送訊息
+                    line_bot_api.push_message(
+                        user_id,
+                        TextSendMessage(text=f"找不到用戶 '{target_user}'，請確認用戶名稱正確。\n\n已知用戶列表:\n{user_list}")
+                    )
                 return
             
             # 創建排班
@@ -867,27 +1145,51 @@ def handle_text_message(event):
             
             # 回覆結果
             if success:
-                safe_send_message(
-                    line_bot_api.reply_message,
-                    reply_token,
-                    TextSendMessage(text=f"已成功為 {target_user} 在 {formatted_date} {formatted_time} 新增排班")
-                )
+                try:
+                    safe_send_message(
+                        line_bot_api.reply_message,
+                        reply_token,
+                        TextSendMessage(text=f"已成功為 {target_user} 在 {formatted_date} {formatted_time} 新增排班"),
+                        event_source=event.source
+                    )
+                except Exception as e:
+                    # 如果回覆失敗，嘗試直接推送訊息
+                    line_bot_api.push_message(
+                        user_id,
+                        TextSendMessage(text=f"已成功為 {target_user} 在 {formatted_date} {formatted_time} 新增排班")
+                    )
             else:
-                safe_send_message(
-                    line_bot_api.reply_message,
-                    reply_token,
-                    TextSendMessage(text=f"為 {target_user} 新增排班失敗，請稍後再試")
-                )
+                try:
+                    safe_send_message(
+                        line_bot_api.reply_message,
+                        reply_token,
+                        TextSendMessage(text=f"為 {target_user} 新增排班失敗，請稍後再試"),
+                        event_source=event.source
+                    )
+                except Exception as e:
+                    # 如果回覆失敗，嘗試直接推送訊息
+                    line_bot_api.push_message(
+                        user_id,
+                        TextSendMessage(text=f"為 {target_user} 新增排班失敗，請稍後再試")
+                    )
         
         # 新功能：批次排班
         elif match := re.match(BATCH_SHIFT_PATTERN, text):
             # 檢查是否為管理員
             if not is_admin(user_id):
-                safe_send_message(
-                    line_bot_api.reply_message,
-                    reply_token,
-                    TextSendMessage(text="抱歉，只有管理員可以使用此功能")
-                )
+                try:
+                    safe_send_message(
+                        line_bot_api.reply_message,
+                        reply_token,
+                        TextSendMessage(text="抱歉，只有管理員可以使用此功能"),
+                        event_source=event.source
+                    )
+                except Exception as e:
+                    # 如果回覆失敗，嘗試直接推送訊息
+                    line_bot_api.push_message(
+                        user_id,
+                        TextSendMessage(text="抱歉，只有管理員可以使用此功能")
+                    )
                 return
                 
             target_user = match.group(1)
@@ -898,31 +1200,58 @@ def handle_text_message(event):
                 known_users = list(user_mapping.keys())
                 user_list = "\n".join([f"- {name}" for name in known_users])
                 
-                safe_send_message(
-                    line_bot_api.reply_message,
-                    reply_token,
-                    TextSendMessage(text=f"找不到用戶 '{target_user}'，請確認用戶名稱正確。\n\n已知用戶列表:\n{user_list}")
-                )
+                try:
+                    safe_send_message(
+                        line_bot_api.reply_message,
+                        reply_token,
+                        TextSendMessage(text=f"找不到用戶 '{target_user}'，請確認用戶名稱正確。\n\n已知用戶列表:\n{user_list}"),
+                        event_source=event.source
+                    )
+                except Exception as e:
+                    # 如果回覆失敗，嘗試直接推送訊息
+                    line_bot_api.push_message(
+                        user_id,
+                        TextSendMessage(text=f"找不到用戶 '{target_user}'，請確認用戶名稱正確。\n\n已知用戶列表:\n{user_list}")
+                    )
                 return
             
             # 創建批次排班
             success, result_message = create_batch_shifts(target_user)
             
             # 回覆結果
-            safe_send_message(
-                line_bot_api.reply_message,
-                reply_token,
-                TextSendMessage(text=result_message)
-            )
+            try:
+                safe_send_message(
+                    line_bot_api.reply_message,
+                    reply_token,
+                    TextSendMessage(text=result_message),
+                    event_source=event.source
+                )
+            except Exception as e:
+                # 如果回覆失敗，嘗試直接推送訊息
+                line_bot_api.push_message(
+                    user_id,
+                    TextSendMessage(text=result_message)
+                )
             
         elif text == "查看用戶映射":
+            # 從資料庫獲取最新的用戶映射
+            user_mapping = get_user_mapping_from_db()
+            
             # 管理員功能：查看當前用戶映射
             mapping_text = "\n".join([f"{name}: {id}" for name, id in user_mapping.items()])
-            safe_send_message(
-                line_bot_api.reply_message,
-                reply_token,
-                TextSendMessage(text=f"當前用戶映射:\n{mapping_text}")
-            )
+            try:
+                safe_send_message(
+                    line_bot_api.reply_message,
+                    reply_token,
+                    TextSendMessage(text=f"當前用戶映射:\n{mapping_text}"),
+                    event_source=event.source
+                )
+            except Exception as e:
+                # 如果回覆失敗，嘗試直接推送訊息
+                line_bot_api.push_message(
+                    user_id,
+                    TextSendMessage(text=f"當前用戶映射:\n{mapping_text}")
+                )
             
         elif text == "測試日曆":
             # 測試 Google Calendar 連接，並列出一週內的排班
@@ -933,11 +1262,19 @@ def handle_text_message(event):
                     events = get_week_calendar_events()
                     
                     if not events:
-                        safe_send_message(
-                            line_bot_api.reply_message,
-                            reply_token,
-                            TextSendMessage(text="Google Calendar 連接成功，但未找到未來一週內的排班")
-                        )
+                        try:
+                            safe_send_message(
+                                line_bot_api.reply_message,
+                                reply_token,
+                                TextSendMessage(text="Google Calendar 連接成功，但未找到未來一週內的排班"),
+                                event_source=event.source
+                            )
+                        except Exception as e:
+                            # 如果回覆失敗，嘗試直接推送訊息
+                            line_bot_api.push_message(
+                                user_id,
+                                TextSendMessage(text="Google Calendar 連接成功，但未找到未來一週內的排班")
+                            )
                     else:
                         # 按日期分組事件
                         events_by_date = {}
@@ -1076,39 +1413,61 @@ def handle_text_message(event):
                             contents=bubble
                         )
                         
-                        safe_send_message(
-                            line_bot_api.reply_message,
-                            reply_token,
-                            flex_message
-                        )
+                        try:
+                            safe_send_message(
+                                line_bot_api.reply_message,
+                                reply_token,
+                                flex_message,
+                                event_source=event.source
+                            )
+                        except Exception as e:
+                            print(f"創建 Flex Message 時發生錯誤: {str(e)}")
+                            # 如果 Flex Message 創建失敗，回退到純文字模式
+                            try:
+                                # 生成排班列表
+                                result = ["未來一週排班表:"]
+                                for date_str in sorted(events_by_date.keys()):
+                                    result.append(f"\n【{date_str}】")
+                                    for event in sorted(events_by_date[date_str], key=lambda x: x['time']):
+                                        result.append(f"{event['time']} - {event['user']}")
+                                
+                                line_bot_api.push_message(
+                                    user_id,
+                                    TextSendMessage(text="\n".join(result))
+                                )
+                            except Exception as text_error:
+                                line_bot_api.push_message(
+                                    user_id,
+                                    TextSendMessage(text=f"Google Calendar 連接成功，但處理事件時發生錯誤: {str(e)}\n回退到文字模式也失敗: {str(text_error)}")
+                                )
                 except Exception as e:
-                    print(f"創建 Flex Message 時發生錯誤: {str(e)}")
-                    # 如果 Flex Message 創建失敗，回退到純文字模式
                     try:
-                        # 生成排班列表
-                        result = ["未來一週排班表:"]
-                        for date_str in sorted(events_by_date.keys()):
-                            result.append(f"\n【{date_str}】")
-                            for event in sorted(events_by_date[date_str], key=lambda x: x['time']):
-                                result.append(f"{event['time']} - {event['user']}")
-                        
                         safe_send_message(
                             line_bot_api.reply_message,
                             reply_token,
-                            TextSendMessage(text="\n".join(result))
+                            TextSendMessage(text=f"Google Calendar 連接成功，但查詢事件時發生錯誤: {str(e)}"),
+                            event_source=event.source
                         )
-                    except Exception as text_error:
-                        safe_send_message(
-                            line_bot_api.reply_message,
-                            reply_token,
-                            TextSendMessage(text=f"Google Calendar 連接成功，但處理事件時發生錯誤: {str(e)}\n回退到文字模式也失敗: {str(text_error)}")
+                    except Exception as reply_error:
+                        # 如果回覆失敗，嘗試直接推送訊息
+                        line_bot_api.push_message(
+                            user_id,
+                            TextSendMessage(text=f"Google Calendar 連接成功，但查詢事件時發生錯誤: {str(e)}")
                         )
             else:
-                safe_send_message(
-                    line_bot_api.reply_message,
-                    reply_token,
-                    TextSendMessage(text="Google Calendar 連接失敗，請檢查服務帳號憑證和日曆 ID 設定")
-                )
+                try:
+                    safe_send_message(
+                        line_bot_api.reply_message,
+                        reply_token,
+                        TextSendMessage(text="Google Calendar 連接失敗，請檢查服務帳號憑證和日曆 ID 設定"),
+                        event_source=event.source
+                    )
+                except Exception as e:
+                    # 如果回覆失敗，嘗試直接推送訊息
+                    line_bot_api.push_message(
+                        user_id,
+                        TextSendMessage(text="Google Calendar 連接失敗，請檢查服務帳號憑證和日曆 ID 設定")
+                    )
                 
         elif text == "清理緩存":
             # 管理員功能：清理緩存
@@ -1121,11 +1480,19 @@ def handle_text_message(event):
             sent_messages.clear()
             processed_calendar_operations.clear()
             
-            safe_send_message(
-                line_bot_api.reply_message,
-                reply_token,
-                TextSendMessage(text=f"緩存清理完成！\n清理前:\n- Webhook 請求: {old_webhook_count}\n- 訊息: {old_message_count}\n- 日曆操作: {old_operation_count}")
-            )
+            try:
+                safe_send_message(
+                    line_bot_api.reply_message,
+                    reply_token,
+                    TextSendMessage(text=f"緩存清理完成！\n清理前:\n- Webhook 請求: {old_webhook_count}\n- 訊息: {old_message_count}\n- 日曆操作: {old_operation_count}"),
+                    event_source=event.source
+                )
+            except Exception as e:
+                # 如果回覆失敗，嘗試直接推送訊息
+                line_bot_api.push_message(
+                    user_id,
+                    TextSendMessage(text=f"緩存清理完成！\n清理前:\n- Webhook 請求: {old_webhook_count}\n- 訊息: {old_message_count}\n- 日曆操作: {old_operation_count}")
+                )
             
         elif text == "幫助":
             # 顯示幫助訊息
@@ -1151,19 +1518,35 @@ def handle_text_message(event):
 - 清理緩存
   清理系統緩存，解決可能的重複訊息問題"""
             
-            safe_send_message(
-                line_bot_api.reply_message,
-                reply_token,
-                TextSendMessage(text=help_text)
-            )
+            try:
+                safe_send_message(
+                    line_bot_api.reply_message,
+                    reply_token,
+                    TextSendMessage(text=help_text),
+                    event_source=event.source
+                )
+            except Exception as e:
+                # 如果回覆失敗，嘗試直接推送訊息
+                line_bot_api.push_message(
+                    user_id,
+                    TextSendMessage(text=help_text)
+                )
             
         else:
             # 未知指令，顯示幫助訊息
-            safe_send_message(
-                line_bot_api.reply_message,
-                reply_token,
-                TextSendMessage(text="未知指令，請輸入「幫助」查看可用指令")
-            )
+            try:
+                safe_send_message(
+                    line_bot_api.reply_message,
+                    reply_token,
+                    TextSendMessage(text="未知指令，請輸入「幫助」查看可用指令"),
+                    event_source=event.source
+                )
+            except Exception as e:
+                # 如果回覆失敗，嘗試直接推送訊息
+                line_bot_api.push_message(
+                    user_id,
+                    TextSendMessage(text="未知指令，請輸入「幫助」查看可用指令")
+                )
             
     except LineBotApiError as e:
         print(f"處理訊息時發生錯誤: {str(e)}")
