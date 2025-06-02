@@ -1405,11 +1405,11 @@ def handle_text_message(event):
                             # 如果 Flex Message 創建失敗，回退到純文字模式
                             
                             # 生成排班列表（純文字備援）
-                                result = ["[備援文字] 未來一週排班表:"]
-                                for date_str in sorted(events_by_date.keys()):
-                                    result.append(f"\n【{date_str}】")
-                                    for event in sorted(events_by_date[date_str], key=lambda x: x['time']):
-                                        result.append(f"{event['time']} - {event['user']}")
+                        result = ["[備援文字] 未來一週排班表:"]
+                        for date_str in sorted(events_by_date.keys()):
+                            result.append(f"\n【{date_str}】")
+                            for event in sorted(events_by_date[date_str], key=lambda x: x['time']):
+                                result.append(f"{event['time']} - {event['user']}")
                                 
                             # ✅ 加上唯一時間標籤，避免被判定為重複訊息
                             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
