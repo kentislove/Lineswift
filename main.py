@@ -1398,29 +1398,32 @@ def handle_text_message(event):
                             safe_send_message(
                                 line_bot_api.reply_message,
                                 reply_token,
-                                flex_message,
-                                
+                                flex_message
                             )
                         except Exception as e:
-                            print(f"創建 Flex Message 時發生錯誤: {str(e)}")
+                            print(f"Flex Message 發送錯誤：{str(e)}")
                             # 如果 Flex Message 創建失敗，回退到純文字模式
-                            try:
-                                # 生成排班列表
-                                result = ["未來一週排班表:"]
+                            
+                            # 生成排班列表（純文字備援）
+                                result = ["[備援文字] 未來一週排班表:"]
                                 for date_str in sorted(events_by_date.keys()):
                                     result.append(f"\n【{date_str}】")
                                     for event in sorted(events_by_date[date_str], key=lambda x: x['time']):
                                         result.append(f"{event['time']} - {event['user']}")
                                 
+                            # ✅ 加上唯一時間標籤，避免被判定為重複訊息
+                            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            result.append(f"\n(產生時間: {timestamp})")
+                            fallback_message = "\n".join(result)
+
+                            try:
                                 line_bot_api.push_message(
                                     user_id,
-                                    TextSendMessage(text="\n".join(result))
+                                    TextSendMessage(text=fallback_message)
                                 )
-                            except Exception as text_error:
-                                line_bot_api.push_message(
-                                    user_id,
-                                    TextSendMessage(text=f"Google Calendar 連接成功，但處理事件時發生錯誤: {str(e)}\n回退到文字模式也失敗: {str(text_error)}")
-                                )
+                            except Exception as push_err:
+                                print(f"推送備援文字時發生錯誤: {push_err}")
+                                
                 except Exception as e:
                     try:
                         safe_send_message(
