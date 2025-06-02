@@ -733,26 +733,13 @@ def handle_text_message(event):
     reply_token = event.reply_token
     user_id = event.source.user_id
     
-    try:
+   try:
         # 獲取用戶資料
         user_profile = line_bot_api.get_profile(user_id)
         user_name = user_profile.display_name
-        
-        # 更新用戶映射並保存到資料庫
-        if user_id not in user_mapping.values():
-            # 檢查是否已有此用戶的映射
-            existing_key = None
-            for k, v in user_mapping.items():
-                if v == user_id:
-                    existing_key = k
-                    break
-            
-            if not existing_key:
-                # 如果沒有此用戶的映射，添加新映射
-                user_mapping[user_name] = user_id
-                # 保存到資料庫
-                save_user_to_db(user_id, user_name)
-                print(f"新用戶已記錄: {user_name} ({user_id})")
+
+        # ✅ 僅紀錄 log，不寫入資料庫
+        print(f"[訊息接收] 用戶名稱: {user_name}，LINE ID: {user_id}")
         
         # 處理換班請求
         if match := re.match(SHIFT_REQUEST_PATTERN, text):
