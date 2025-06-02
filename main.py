@@ -3,7 +3,6 @@ import re
 import json
 import hashlib
 import time
-import sqlite3
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -47,131 +46,16 @@ ADD_SHIFT_PATTERN = r"新增排班\s+(\d{8})\s+(\d{2}):(\d{2})\s*@(.+)"
 # 匹配格式: "批次排班 @用戶名"
 BATCH_SHIFT_PATTERN = r"批次排班\s*@(.+)"
 
-# ====== 資料庫設定 ======
-# 資料庫檔案路徑
-DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "line_bot.db")
-
-def init_database():
-    """初始化資料庫"""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
-    # 創建用戶表
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        line_id TEXT UNIQUE NOT NULL,
-        display_name TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    ''')
-
-    # 創建換班請求表
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS shift_requests (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        request_id TEXT UNIQUE NOT NULL,
-        requester_id TEXT NOT NULL,
-        requester_name TEXT NOT NULL,
-        target_id TEXT NOT NULL,
-        target_name TEXT NOT NULL,
-        date TEXT NOT NULL,
-        time TEXT NOT NULL,
-        status TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    ''')
-
-    conn.commit()
-    conn.close()
-    print(f"資料庫初始化完成: {DB_FILE}")
-
-
-# 初始化資料庫
-init_database()
-
-def get_user_mapping_from_db():
-    """從資料庫獲取用戶映射"""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT display_name, line_id FROM users")
-    results = cursor.fetchall()
-    
-    conn.close()
-    
-    # 轉換為字典
-    return {name: line_id for name, line_id in results}
-
-def save_user_to_db(line_id, display_name):
-    """將用戶保存到資料庫"""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    
-    try:
-        # 檢查用戶是否已存在
-        cursor.execute("SELECT id FROM users WHERE line_id = ?", (line_id,))
-        user = cursor.fetchone()
-        
-        if user:
-            # 更新用戶名稱
-            cursor.execute(
-                "UPDATE users SET display_name = ?, updated_at = CURRENT_TIMESTAMP WHERE line_id = ?",
-                (display_name, line_id)
-            )
-            print(f"用戶資料已更新: {display_name} ({line_id})")
-        else:
-            # 新增用戶
-            cursor.execute(
-                "INSERT INTO users (line_id, display_name) VALUES (?, ?)",
-                (line_id, display_name)
-            )
-            print(f"新用戶已記錄: {display_name} ({line_id})")
-        
-        conn.commit()
-        return True
-    except Exception as e:
-        print(f"保存用戶到資料庫時發生錯誤: {str(e)}")
-        return False
-    finally:
-        conn.close()
-
-def save_shift_request_to_db(request_data):
-    """將換班請求保存到資料庫"""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute(
-            """
-            INSERT OR REPLACE INTO shift_requests 
-            (request_id, requester_id, requester_name, target_id, target_name, date, time, status, updated_at) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            """,
-            (
-                request_data["request_id"],
-                request_data["requester_id"],
-                request_data["requester_name"],
-                request_data["target_id"],
-                request_data["target_name"],
-                request_data["date"],
-                request_data["time"],
-                request_data["status"]
-            )
-        )
-        
-        conn.commit()
-        return True
-    except Exception as e:
-        print(f"保存換班請求到資料庫時發生錯誤: {str(e)}")
-        return False
-    finally:
-        conn.close()
-
-# 用於存儲用戶名稱與 LINE ID 的對應關係
-user_mapping = get_user_mapping_from_db()
+# ====== 用戶管理 ======
+# 初始化用戶映射表 - 用戶名稱與 LINE ID 對應關係
+# 格式: {"用戶名稱": "LINE_USER_ID"}
+USER_MAPPING = {
+    "張書豪-Ragic SA Promote": "Uf15abf85bca4ee133d1027593de4d1ad",
+    "KentChang-廠內維修中": "Ub2eb02fea865d917854d6ecaace84c70",
+    "Eva-家萍": "eva700802",
+    "張書豪-Ragic Customize!": "kent1027",
+    "鄭銘貴": "U0c63e33715aebc37754bc2cf522ab6fa"
+}
 
 # 用於存儲換班請求
 shift_requests = {}
@@ -272,80 +156,70 @@ def clean_expired_records(records_dict, expiry_seconds):
         del records_dict[key]
 
 def safe_send_message(method, *args, **kwargs):
-    """
-    安全發送訊息，避免重複發送。  
-    改寫要點：  
-    1. 直接用 event.source.user_id 當 user_id，不要再把 reply_token 當成 user_id。
-    2. 如果捕捉到 Invalid reply token，就 fallback 一次 push_message，然後 return，而不要 re-raise Exception。
-    """
+    """安全發送訊息，避免重複發送"""
+    # 提取用戶 ID 和訊息內容
     user_id = None
     message_text = None
-
-    # 先從 kwargs 裡取 event_source（handler.handle 會傳 event_source=event.source）
-    event_source = kwargs.get("event_source", None)
-    if event_source and hasattr(event_source, "user_id"):
-        user_id = event_source.user_id
-
-    # 判斷要送的是 reply_message 還是 push_message
+    
     if method == line_bot_api.reply_message:
-        # args[0] 應該是 reply_token
-        # args[1] 可能是 TextSendMessage、TemplateSendMessage、FlexSendMessage...
-        # 若是 TextSendMessage，可以取 text；否則我們後面再 fallback push，所以這裡先嘗試擷取：
-        msg_obj = args[1]
-        if isinstance(msg_obj, TextSendMessage) and hasattr(msg_obj, 'text'):
-            message_text = msg_obj.text
-    elif method == line_bot_api.push_message:
-        # args[0] 是 userId，args[1] 是 message 物件
-        msg_obj = args[1]
-        if isinstance(msg_obj, TextSendMessage) and hasattr(msg_obj, 'text'):
-            message_text = msg_obj.text
-        # user_id 就直接用 args[0]
+        # reply_message(reply_token, messages)
+        message_obj = args[1]
+        if isinstance(message_obj, list):
+            message_obj = message_obj[0]
+        if hasattr(message_obj, 'text'):
+            message_text = message_obj.text
+        elif isinstance(message_obj, FlexSendMessage):
+            # 對於 Flex Message，使用 alt_text 作為訊息內容
+            message_text = message_obj.alt_text
+        # 對於 reply_message，我們使用 reply_token 作為用戶標識
         user_id = args[0]
-
-    # 如果沒有 user_id，就直接執行，不做去重判斷
+    elif method == line_bot_api.push_message:
+        # push_message(to, messages)
+        user_id = args[0]
+        message_obj = args[1]
+        if isinstance(message_obj, list):
+            message_obj = message_obj[0]
+        if hasattr(message_obj, 'text'):
+            message_text = message_obj.text
+        elif isinstance(message_obj, FlexSendMessage):
+            # 對於 Flex Message，使用 alt_text 作為訊息內容
+            message_text = message_obj.alt_text
+    
+    # 如果無法提取訊息內容，直接發送
     if not user_id or not message_text:
-        try:
-            return method(*args, **kwargs)
-        except LineBotApiError as e:
-            # 若是推播失敗也不要影響下游
-            print(f"訊息推送失敗 (no user_id or no message_text)：{str(e)}")
-            return None
-
-    # 去重機制：檢查 message_hash
-    # 這裡改用 user_id + message_text 來算 hash
-    message_hash = generate_hash(f"{user_id}_{message_text}")
-    if message_hash in sent_messages:
-        last_time = sent_messages[message_hash]
-        if time.time() - last_time < MESSAGE_EXPIRY:
-            print(f"跳過重複訊息: {message_text[:30]}...")
-            return None
-    # 紀錄一次
-    sent_messages[message_hash] = time.time()
-    clean_expired_records(sent_messages, MESSAGE_EXPIRY)
-
-    # 真正送訊息
+        return method(*args, **kwargs)
+    
+    # 檢查是否重複發送
+    if is_duplicate_message(user_id, message_text):
+        print(f"跳過重複訊息: {message_text[:30]}...")
+        return None
+    
+    # 發送訊息
     try:
         return method(*args, **kwargs)
     except LineBotApiError as e:
-        err_str = str(e)
-        print(f"發送訊息時發生錯誤: {err_str}")
-
-        # 如果是 "Invalid reply token" 且原本用的是 reply_message，就改用 push_message
-        if "Invalid reply token" in err_str and method == line_bot_api.reply_message:
-            print("reply_token 無效，改用 push_message 傳送")
-
-            # 重新組成 push_message 的 args：user_id, messages
-            msg_obj = args[1]  # e.g. TextSendMessage or FlexSendMessage
-            try:
-                line_bot_api.push_message(user_id, msg_obj)
-            except Exception as push_err:
-                print(f"fallback push_message 也發生錯誤：{str(push_err)}")
-            # 不要再把例外拋出去，直接 return，以免被 webhook 端誤判失敗
-            return None
-
-        # 如果是其他錯誤，或原本就不是 reply_message，直接 return None
-        return None
-
+        print(f"發送訊息時發生錯誤: {str(e)}")
+        
+        # 如果是 reply token 無效的錯誤，嘗試使用 push message
+        if "Invalid reply token" in str(e) and method == line_bot_api.reply_message:
+            print("嘗試使用 push message 替代 reply message")
+            
+            # 從 event 中獲取用戶 ID
+            event_source = kwargs.get("event_source")
+            if event_source and hasattr(event_source, "user_id"):
+                user_id = event_source.user_id
+                
+                # 使用 push message 發送訊息
+                try:
+                    return line_bot_api.push_message(user_id, args[1])
+                except Exception as push_error:
+                    print(f"使用 push message 發送訊息時發生錯誤: {str(push_error)}")
+        
+        # 如果發送失敗，從記錄中移除此訊息
+        message_hash = generate_hash(f"{user_id}_{message_text}")
+        if message_hash in sent_messages:
+            del sent_messages[message_hash]
+        raise
 
 # ====== Google Calendar API 設定 ======
 def get_calendar_service():
@@ -687,7 +561,7 @@ def is_admin(user_id):
     """檢查用戶是否為管理員"""
     # 在實際應用中，您可能需要從數據庫或配置文件中讀取管理員列表
     # 這裡簡單地假設所有已知用戶都是管理員
-    return user_id in user_mapping.values()
+    return user_id in USER_MAPPING.values()
 
 # ====== FastAPI 應用 ======
 app = FastAPI()
@@ -744,13 +618,6 @@ def handle_text_message(event):
     user_id = event.source.user_id
     
     try:
-        # 獲取用戶資料
-        user_profile = line_bot_api.get_profile(user_id)
-        user_name = user_profile.display_name
-
-        # ✅ 僅紀錄 log，不寫入資料庫
-        print(f"[訊息接收] 用戶名稱: {user_name}，LINE ID: {user_id}")
-        
         # 處理換班請求
         if match := re.match(SHIFT_REQUEST_PATTERN, text):
             date_str, hour, minute, target_user = match.groups()
@@ -799,10 +666,10 @@ def handle_text_message(event):
                 return
             
             # 檢查目標用戶是否存在
-            target_user_id = user_mapping.get(target_user)
+            target_user_id = USER_MAPPING.get(target_user)
             if not target_user_id:
                 # 列出所有已知用戶，幫助用戶選擇正確的用戶名稱
-                known_users = list(user_mapping.keys())
+                known_users = list(USER_MAPPING.keys())
                 user_list = "\n".join([f"- {name}" for name in known_users])
                 
                 try:
@@ -817,6 +684,29 @@ def handle_text_message(event):
                     line_bot_api.push_message(
                         user_id,
                         TextSendMessage(text=f"找不到用戶 '{target_user}'，請確認用戶名稱正確。\n\n已知用戶列表:\n{user_list}")
+                    )
+                return
+            
+            # 獲取用戶名稱
+            user_name = None
+            for name, id in USER_MAPPING.items():
+                if id == user_id:
+                    user_name = name
+                    break
+            
+            if not user_name:
+                try:
+                    safe_send_message(
+                        line_bot_api.reply_message,
+                        reply_token,
+                        TextSendMessage(text="無法識別您的用戶身份，請聯繫管理員"),
+                        event_source=event.source
+                    )
+                except Exception as e:
+                    # 如果回覆失敗，嘗試直接推送訊息
+                    line_bot_api.push_message(
+                        user_id,
+                        TextSendMessage(text="無法識別您的用戶身份，請聯繫管理員")
                     )
                 return
             
@@ -857,9 +747,6 @@ def handle_text_message(event):
             }
             
             shift_requests[request_id] = request_data
-            
-            # 保存到資料庫
-            save_shift_request_to_db(request_data)
             
             # 回覆請求者
             try:
@@ -970,9 +857,6 @@ def handle_text_message(event):
                 request["status"] = "approved"
                 request["response_time"] = time.time()
                 
-                # 保存到資料庫
-                save_shift_request_to_db(request)
-                
                 # 更新 Google Calendar
                 success = swap_shifts(
                     request["date"], 
@@ -1021,9 +905,6 @@ def handle_text_message(event):
                 # 更新請求狀態
                 request["status"] = "rejected"
                 request["response_time"] = time.time()
-                
-                # 保存到資料庫
-                save_shift_request_to_db(request)
                 
                 # 回覆目標用戶
                 try:
@@ -1112,9 +993,9 @@ def handle_text_message(event):
                 return
             
             # 檢查目標用戶是否存在
-            if target_user not in user_mapping:
+            if target_user not in USER_MAPPING:
                 # 列出所有已知用戶，幫助用戶選擇正確的用戶名稱
-                known_users = list(user_mapping.keys())
+                known_users = list(USER_MAPPING.keys())
                 user_list = "\n".join([f"- {name}" for name in known_users])
                 
                 try:
@@ -1131,6 +1012,13 @@ def handle_text_message(event):
                         TextSendMessage(text=f"找不到用戶 '{target_user}'，請確認用戶名稱正確。\n\n已知用戶列表:\n{user_list}")
                     )
                 return
+            
+            # 獲取用戶名稱
+            user_name = None
+            for name, id in USER_MAPPING.items():
+                if id == user_id:
+                    user_name = name
+                    break
             
             # 創建排班
             success = create_or_update_event(
@@ -1192,9 +1080,9 @@ def handle_text_message(event):
             target_user = match.group(1)
             
             # 檢查目標用戶是否存在
-            if target_user not in user_mapping:
+            if target_user not in USER_MAPPING:
                 # 列出所有已知用戶，幫助用戶選擇正確的用戶名稱
-                known_users = list(user_mapping.keys())
+                known_users = list(USER_MAPPING.keys())
                 user_list = "\n".join([f"- {name}" for name in known_users])
                 
                 try:
@@ -1231,11 +1119,8 @@ def handle_text_message(event):
                 )
             
         elif text == "查看用戶映射":
-            # 從資料庫獲取最新的用戶映射
-            user_mapping = get_user_mapping_from_db()
-            
             # 管理員功能：查看當前用戶映射
-            mapping_text = "\n".join([f"{name}: {id}" for name, id in user_mapping.items()])
+            mapping_text = "\n".join([f"{name}: {id}" for name, id in USER_MAPPING.items()])
             try:
                 safe_send_message(
                     line_bot_api.reply_message,
@@ -1414,14 +1299,19 @@ def handle_text_message(event):
                             safe_send_message(
                                 line_bot_api.reply_message,
                                 reply_token,
-                                flex_message
+                                flex_message,
+                                event_source=event.source
                             )
                         except Exception as e:
-                            print(f"Flex Message 發送錯誤：{str(e)}")
-                            # 這裡不做任何補述，也不推送備援文字
-                            
-
-                                
+                            print(f"創建 Flex Message 時發生錯誤: {str(e)}")
+                            # 如果 Flex Message 發送失敗，嘗試直接推送
+                            try:
+                                line_bot_api.push_message(
+                                    user_id,
+                                    flex_message
+                                )
+                            except Exception as push_error:
+                                print(f"使用 push message 發送 Flex Message 時發生錯誤: {str(push_error)}")
                 except Exception as e:
                     try:
                         safe_send_message(
