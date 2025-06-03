@@ -198,7 +198,14 @@ def safe_send_message(method, *args, **kwargs):
     try:
         return method(*args, **kwargs)
     except LineBotApiError as e:
+        if hasattr(e, "status_code") and e.status_code == 429:
+            print("LINE 發訊息已達本月上限，訊息未送出。")
+            return None
+        
         print(f"發送訊息時發生錯誤: {str(e)}")
+        # 其他例外 fallback or raise
+        ...
+
         
         # 如果是 reply token 無效的錯誤，嘗試使用 push message
         if "Invalid reply token" in str(e) and method == line_bot_api.reply_message:
